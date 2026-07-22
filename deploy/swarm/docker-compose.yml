@@ -1,0 +1,62 @@
+# Stack de Docker Swarm para mcp-corp, balanceado por Traefik en Portainer.
+#
+# Objetivo de este archivo: demostrar que el server es horizontalmente
+# escalable porque es stateless por invocación (2 réplicas idénticas,
+# cualquiera puede atender cualquier request).
+#
+# Uso:
+#   docker stack deploy -c deploy/swarm/docker-compose.yml mcp-corp
+#
+# Requiere una red overlay externa llamada "traefik-public" con Traefik
+# corriendo como el edge router del swarm (patrón estándar de Portainer).
+
+version: "3.9"
+
+services:
+  mcp-corp:
+    image: mcp-corp:latest
+    environment:
+      MCP_CORP_SERVICE_NAME: mcp-corp
+      MCP_CORP_ENVIRONMENT: production
+      MCP_CORP_HOST: "0.0.0.0"
+      MCP_CORP_PORT: "8000"
+      MCP_CORP_LOG_LEVEL: INFO
+      MCP_CORP_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS: "10"
+    networks:
+      - traefik-public
+    healthcheck:
+      # Mismo endpoint de liveness que el HEALTHCHECK del Dockerfile.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    deploy:
+      # Dos réplicas para demostrar escalado horizontal detrás de Traefik.
+      # El proceso no guarda estado local, así que cualquier réplica puede
+      # atender cualquier request sin sticky sessions.
+      replicas: 2
+      update_config:
+        order: start-first
+        failure_action: rollback
+      restart_policy:
+        condition: on-failure
+      labels:
+        # Habilita el descubrimiento de este servicio por Traefik.
+        - "traefik.enable=true"
+        - "traefik.docker.network=traefik-public"
+
+        # Router HTTP: ajustar el Host() al dominio real antes de producción.
+        - "traefik.http.routers.mcp-corp.rule=Host(`mcp-corp.local`)"
+        - "traefik.http.routers.mcp-corp.entrypoints=web"
+
+        # Traefik balancea round-robin entre las réplicas de este servicio.
+        - "traefik.http.services.mcp-corp.loadbalancer.server.port=8000"
+
+        # Traefik también puede vigilar la salud de cada réplica.
+        - "traefik.http.services.mcp-corp.loadbalancer.healthcheck.path=/health"
+        - "traefik.http.services.mcp-corp.loadbalancer.healthcheck.interval=10s"
+
+networks:
+  traefik-public:
+    external: true

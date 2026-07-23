@@ -13,7 +13,9 @@ ENV UV_COMPILE_BYTECODE=1 \
     UV_PROJECT_ENVIRONMENT=/opt/venv
 
 # Copiamos solo los manifiestos primero para aprovechar la cache de capas.
-COPY pyproject.toml uv.lock ./
+# README.md se incluye porque pyproject.toml lo referencia como `readme` y
+# hatchling lo exige al construir el paquete (ver builder 7/7 más abajo).
+COPY pyproject.toml uv.lock README.md ./
 RUN uv sync --frozen --no-install-project --no-dev
 
 # Ahora sí el código fuente, e instalamos el propio paquete (sin dev deps).

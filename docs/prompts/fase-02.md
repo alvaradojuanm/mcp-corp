@@ -1,160 +1,116 @@
-Continuamos el proyecto mcp-corp. La FASE 1 (andamiaje base) está CERRADA y mergeada en `main`:
-server FastMCP 3.4.4 sobre Streamable HTTP, stateless, con config vía pydantic-settings,
-logging JSON con correlation id, /health y /ready separados, graceful shutdown y contenedor
-no-root verificado. Partimos de ahí.
+# Fase 02 — Capa de conectores
 
-Esta es la FASE 2: la CAPA DE CONECTORES. NO implementes tools MCP todavía — eso es la Fase 3.
-Esta fase construye la infraestructura sobre la que las tools se apoyarán después.
+| Campo | Valor |
+|---|---|
+| **Fase** | 02 |
+| **Objetivo** | Capa genérica de resiliencia + primer conector real (PostgreSQL). Sin tools MCP. |
+| **Repo** | `github.com/alvaradojuanm/mcp-corp` |
+| **Commits** | `568e23b` → `5a0ee55` (5 commits, pusheados a `main`) |
+| **Estado** | ✅ **CERRADA** |
+| **Fecha de cierre** | 23 de julio de 2026 |
+| **Versiones pineadas** | `psycopg[binary]==3.3.4` · `psycopg-pool==3.3.1` |
 
-## El norte de esta fase
-Cada fuente de datos (bases de datos, APIs REST, sistemas legacy) debe quedar encapsulada en un
-módulo autocontenido que sepa DOS cosas: cómo hablarle a su fuente, y cómo protegerse a sí mismo
-y a la fuente. Cuando en fases futuras sumemos 50 fuentes, agregar una debe ser "escribir cómo
-hablo con ella", no reimplementar resiliencia.
+---
 
-## DECISIÓN DE ARQUITECTURA CENTRAL — dos capas, no una
-NO hagas un "conector Postgres" que adentro tenga su semáforo, su timeout y su breaker, y luego
-repitas esa lógica en cada conector nuevo. Sepáralo:
+## Resultado
 
-1. **Capa genérica de resiliencia** — no sabe nada de Postgres ni de HTTP. Solo sabe limitar
-   concurrencia, cortar por timeout y abrir/cerrar el circuito. Se escribe UNA vez.
-2. **Conectores concretos** — cada uno solo sabe cómo hablarle a su fuente. La resiliencia la
-   reciben envueltos por la capa de arriba.
+Capa de resiliencia genérica y conector PostgreSQL funcionando, validados de punta a punta contra un Postgres real. **A diferencia de la Fase 1, el agente sí tuvo Docker disponible y no quedaron puntos ciegos de verificación.**
 
-Define un protocolo/ABC común que todo conector debe cumplir (p. ej. `connect`, `close`,
-`health`, y la ejecución de una operación), de modo que la capa de resiliencia envuelva a
-cualquiera de forma uniforme.
+### Estructura resultante
 
-## ALCANCE EXACTO DE ESTA FASE
-Capa genérica de resiliencia **+ UN conector real de PostgreSQL**. El conector real no es opcional:
-una abstracción diseñada sin un usuario concreto sale mal, y necesitamos validar la capa contra
-algo que de verdad abre conexiones. No implementes conectores de API REST todavía — pero deja el
-diseño listo para que agregarlo sea trivial.
+```
+src/mcp_corp/connectors/
+├── base.py         # Protocol Connector: connect / close / health / run
+├── resilience.py   # BoundedSemaphore por fuente + asyncio.timeout() + CircuitBreaker propio
+├── registry.py     # ciclo de vida de conectores + agregación de /diagnostics
+└── postgres.py     # psycopg_pool.AsyncConnectionPool
 
-## DECISIONES YA TOMADAS (no las reabras, ya fueron investigadas)
+tests/
+├── conftest.py
+└── connectors/
+    ├── test_resilience.py            # unitarios con FakeConnector
+    └── test_postgres_integration.py  # integración contra Postgres real
 
-**Driver: psycopg3 con su pool async (`psycopg_pool`). NO uses asyncpg.**
-La razón es compatibilidad con PgBouncer: cuando escalemos réplicas, PgBouncer en modo
-"transaction" no soporta prepared statements, y asyncpg los usa automáticamente, lo que rompe con
-`DuplicatePreparedStatementError`. Peor aún, ese fallo SOLO aparece bajo presión del pool —
-pasaría todas las pruebas y explotaría en producción. psycopg3 maneja esto mejor por diseño con su
-`prepare_threshold` adaptativo. La diferencia de rendimiento entre ambos drivers no es nuestro
-cuello de botella.
+docker-compose.dev.yml
+deploy/dev/postgres-seed.sql
+```
 
-**Circuit breaker: implementación propia, NO una librería externa.**
-Las semánticas son simples (cerrado / abierto / medio-abierto, con umbral de fallos y tiempo de
-reset) y son ~80 líneas. Las alternativas de PyPI son proyectos de un solo mantenedor, y este
-código va en el camino crítico de un sistema bancario: cada dependencia que no metemos es
-superficie de supply chain que no tenemos que defender. Código propio, tipado y auditable.
+**Modificados:** `config.py` (bloque `PostgresSettings`), `server.py` (`/diagnostics`, `/ready` corregido), `main.py` (wiring del registry), `.env.example`, `README.md`, `.gitignore`, `pyproject.toml`, `uv.lock`.
 
-**Concurrencia: `asyncio.BoundedSemaphore`, UNO POR FUENTE (no global).**
-Bounded (no el `Semaphore` normal) porque atrapa bugs de over-release. Por fuente, para que el
-backpressure de cada una sea independiente: si el core bancario se satura, eso no debe afectar
-las consultas a Postgres.
+---
 
-**Timeouts: `asyncio.timeout()` (Python 3.11+), NO `asyncio.wait_for`.**
-Y si en algún punto necesitas concurrencia estructurada, `asyncio.TaskGroup`, NO `asyncio.gather`
-(gather deja tareas huérfanas corriendo cuando una falla).
+## Verificaciones de aceptación
 
-**`/ready` NO se acopla a la salud de las fuentes.**
-Esto contradice una promesa del README de la Fase 1 — corrígela ahí. El razonamiento: si el
-breaker de una fuente se abre y eso pone `/ready` en 503, el balanceador saca la réplica entera de
-rotación y las demás tools que SÍ funcionan dejan de atenderse. Empeora la situación. `/ready`
-sigue reflejando solo el estado del proceso. El estado de los conectores se expone por separado
-(ver abajo).
+- [x] **12/12 tests pasando** contra Postgres real (no mocks)
+- [x] 7 unitarios de resiliencia: semáforo limitando concurrencia real, timeout de espera de slot, timeout de operación, apertura del breaker al umbral, medio-abierto tras reset (con reloj falso), reapertura ante fallo en medio-abierto, y que **errores de negocio nunca abren el circuito**
+- [x] 5 de integración: conexión + health real, query parametrizada, `pool_stats()`, ejecución envuelta en `ResilientExecutor`, y rechazo tras `close()`
+- [x] Server end-to-end con `MCP_CORP_POSTGRES__ENABLED=true`
+- [x] `/health` y `/ready` intactos — **`/ready` NO se acopla a la salud de las fuentes**
+- [x] `/diagnostics` reportando `circuit_state`, `in_flight` y stats reales del pool
+- [x] Campo de límite de tasa reservado y documentado en 4 lugares (`.env.example`, `config.py`, `resilience.py`, `README.md`)
+- [x] `pip-audit`: 82 paquetes, **`No known vulnerabilities found`**
+- [x] `requirements-audit.txt` excluido en `.gitignore`
+- [x] README de la Fase 1 corregido respecto a `/ready`
+- [x] Autoría verificada: solo `alvaradojuanm` + noreply, sin coautorías
 
-## REQUISITOS DE CADA PIEZA
+---
 
-### Capa de resiliencia (`src/mcp_corp/connectors/resilience.py` o similar)
-- **Límite de concurrencia** por fuente con `BoundedSemaphore`. Si el límite está saturado, la
-  petición espera; si espera más de lo razonable, falla limpio (no encolar infinito).
-- **Timeout** por operación con `asyncio.timeout()`.
-- **Circuit breaker** propio con los tres estados. Configurables: umbral de fallos consecutivos
-  para abrir, tiempo antes de pasar a medio-abierto, y cuántos éxitos se requieren para cerrar.
-  Distingue fallos de infraestructura (que cuentan para abrir el circuito) de errores de negocio
-  legítimos (que NO deben abrirlo).
-- **Estado del breaker es POR RÉPLICA.** Cada réplica descubre una fuente caída de forma
-  independiente. Esto es intencional; documéntalo como decisión, no lo dejes como accidente.
-  (Estado compartido vía Redis queda como opción futura, no ahora.)
-- Cada evento relevante (circuito abre, circuito cierra, timeout, límite saturado) debe quedar en
-  el **log estructurado JSON** con el correlation id que ya existe.
-- Errores hacia afuera: nunca filtres internals (ni stack traces, ni strings de conexión, ni SQL).
+## Decisiones tomadas por el agente
 
-### Conector PostgreSQL (`src/mcp_corp/connectors/postgres.py` o similar)
-- psycopg3 + `psycopg_pool` async, con pool acotado y configurable.
-- Ciclo de vida atado al lifespan del server: el pool se abre al arrancar y se cierra limpio en el
-  graceful shutdown que ya funciona.
-- Un método de health propio (algo tipo `SELECT 1`) que la capa de diagnóstico pueda consultar.
-- Credenciales SOLO desde config/entorno. Cero hardcode, cero valores reales en el repo.
-- Consultas siempre parametrizadas — nunca concatenación de strings en SQL.
+| Decisión | Veredicto |
+|---|---|
+| `psycopg[binary]==3.3.4` + `psycopg-pool==3.3.1` | ✅ Conforme a lo investigado (psycopg3 por compatibilidad con PgBouncer) |
+| Patrón `AsyncConnectionPool(open=False)` + `await pool.open(wait=True)` explícito | ✅ Verificado contra docs — abrir en el constructor está deprecado |
+| `registry.py` (no estaba en el prompt) | ✅ **Buena adición.** Centraliza ciclo de vida y agregación de diagnostics; evita wiring regado cuando lleguen 50 fuentes |
+| Fix de `WindowsSelectorEventLoopPolicy` | ✅ Aprobada con nota (ver abajo) |
+| Errores de negocio cuentan como **éxito** para el breaker | ✅ Aprobada — si la fuente respondió, la fuente está sana |
+| Medio-abierto reabre al **primer** fallo | ✅ Aprobada — semántica estándar |
 
-### Configuración por fuente
-Cada conector con su propio bloque de config: `max_concurrency`, `timeout`, umbral y reset del
-breaker, tamaño de pool, credenciales. Refleja todo en `.env.example`.
+### Hallazgo: psycopg async no corre sobre ProactorEventLoop (Windows)
 
-Incluye también un campo preparado (aunque no se use aún) para **límite de tasa (req/s)**, con un
-comentario explicando que el semáforo limita concurrencia, NO tasa — si una fuente declara un
-techo en req/s hará falta un token bucket encima. Es un hueco conocido, déjalo señalado.
+No estaba anticipado en el prompt. El default de asyncio en Windows es `ProactorEventLoop`, incompatible con psycopg async.
 
-### Endpoint de diagnóstico
-Expón el estado de cada conector (estado del breaker, uso del pool, última verificación de salud)
-en un endpoint SEPARADO de `/health` y `/ready` — algo como `/diagnostics` o `/connectors`. Sirve
-para observar y alertar sin sacar la réplica del balanceo.
+- **Fix:** `WindowsSelectorEventLoopPolicy` en `tests/conftest.py` y, condicionado a `sys.platform == "win32"`, en `main.py`.
+- **Impacto:** ninguno en el contenedor Linux de producción.
+- **Nota abierta:** queda código específico de plataforma en `main.py`, no solo en tests. Está condicionado y documentado, y permite desarrollar en local sin fricción — pero es código de conveniencia de desarrollo viviendo en el entrypoint de producción. Fichado, no bloqueante.
 
-### Tests
-- **Unitarios de la capa de resiliencia** con un conector falso: es fácil forzar fallos y verificar
-  que el breaker abre al umbral, que pasa a medio-abierto tras el reset, que cierra al recuperarse,
-  que el timeout dispara y que el semáforo limita de verdad. Esta capa DEBE quedar bien cubierta.
-- **Integración del conector Postgres** contra un Postgres real levantado con docker-compose de
-  desarrollo (añádelo en `deploy/` o `docker-compose.dev.yml`, con datos semilla mínimos).
+### Nota sobre "errores de negocio cuentan como éxito"
 
-### Documentación (README)
-- Explica la separación en dos capas y por qué.
-- Documenta la fórmula de capacidad: **límite por réplica = techo de la fuente ÷ nº de réplicas**.
-  Con un ejemplo numérico. Es la regla que evita que al escalar réplicas ahoguemos la fuente.
-- Documenta las decisiones de esta fase con el mismo nivel de la sección "Decisiones de diseño"
-  que ya existe: por qué psycopg3, por qué breaker propio, por qué estado por réplica, por qué
-  `/ready` no se acopla a las fuentes.
-- Corrige la promesa del README de la Fase 1 sobre `/ready` reflejando la salud de conectores.
+Coherente, pero con una consecuencia a tener presente: **en estado medio-abierto, una respuesta con error de negocio ayuda a cerrar el circuito.** Es correcto bajo el criterio elegido (la fuente respondió), pero conviene saberlo si alguna vez el comportamiento del breaker sorprende.
 
-## ANTES DE ESCRIBIR CÓDIGO
-Verifica en PyPI/documentación oficial las versiones actuales y estables de `psycopg[binary]` y
-`psycopg_pool`, y confirma la API vigente del pool async (`AsyncConnectionPool`: apertura,
-cierre, y el patrón recomendado de ciclo de vida — hubo cambios en cómo se abre el pool en
-versiones recientes). PINEA versiones exactas. Si algo no lo puedes verificar, dímelo en vez de
-inventar.
+---
 
-## LECCIONES DE LA FASE 1 — aplícalas
-1. **"El build pasa" ≠ "funciona".** En la Fase 1 un bug pasó el build limpio y reventó al
-   arrancar el contenedor. Verifica que las cosas CORRAN, no solo que compilen.
-2. Si NO puedes verificar algo por límites de tu entorno (sin daemon de Docker, sin Postgres),
-   **dilo explícitamente** en tu reporte en vez de asumir que funciona. Yo lo valido en mi máquina.
-3. Al terminar, corre la auditoría de dependencias:
-   `uv export --no-hashes --format requirements-txt > requirements-audit.txt`
-   `uvx pip-audit -r requirements-audit.txt`
-   Y añade `requirements-audit.txt` al `.gitignore` (es un artefacto derivado).
+## Diseño consolidado en esta fase
 
-## GIT
-- Identidad ya configurada: `alvaradojuanm` / `114210637+alvaradojuanm@users.noreply.github.com`.
-  VERIFÍCALA antes de commitear y corrígela si el entorno la reseteó.
-- **POLÍTICA DE AUTORÍA OBLIGATORIA:** todos los commits ÚNICAMENTE bajo `alvaradojuanm`. NO
-  añadas `Co-authored-by:`. NO añadas firmas de herramienta ("Generated with...", 🤖, ni nada
-  similar). NO te acredites de ninguna forma. El mensaje contiene solo la descripción del cambio.
-- Trabajamos trunk-based: parte de `main` actualizado. Commits atómicos y descriptivos.
-- Guarda una copia EXACTA de este prompt como `docs/prompts/fase-02.md`.
-- NUNCA `.env`, credenciales ni secretos en ningún commit.
-- Verifica con `git log --format='%an <%ae>'` antes de empujar.
+**Separación en dos capas.** La capa de resiliencia no sabe nada de Postgres: solo limita concurrencia, corta por timeout y abre/cierra el circuito. Los conectores concretos solo saben hablarle a su fuente. Agregar una fuente nueva = escribir cómo se le habla; la resiliencia se hereda.
 
-## AL TERMINAR, REPORTA
-1. Versiones exactas pineadas de psycopg y psycopg_pool.
-2. Qué archivos creaste y la estructura resultante de `connectors/`.
-3. Resultado de los tests (unitarios de resiliencia + integración con Postgres).
-4. Resultado de `pip-audit`.
-5. Qué NO pudiste verificar por límites del entorno.
-6. Cualquier decisión donde tuviste que elegir por mí.
-7. Confirmación de que la autoría quedó limpia.
+**PostgreSQL como primer inquilino, no como caso único.** Se eligió por ser el más exigente (pool, ciclo de vida, credenciales) y por estar disponible para pruebas reales. Una abstracción sin usuario concreto sale con huecos.
 
-NO avances a tools MCP. Esta fase termina en la capa de conectores con Postgres funcionando.
+**Estado del breaker por réplica.** Cada réplica descubre una fuente caída de forma independiente. Intencional y documentado. Estado compartido vía Redis queda como opción futura.
 
-Si algo es ambiguo o no puedes verificar contra la documentación actual, PREGUNTA antes de asumir.
-Prefiero corregir el rumbo ahora que rehacer después.
+**`/ready` desacoplado de las fuentes.** Si el breaker de una fuente abriera `/ready`, el balanceador sacaría la réplica entera de rotación y las tools sanas dejarían de atenderse. El estado de conectores vive en `/diagnostics`, para observar y alertar sin afectar el balanceo.
+
+**Hueco conocido: límite de tasa.** El semáforo limita **concurrencia** (operaciones simultáneas), no **tasa** (req/s). Si una fuente declara un techo en req/s hará falta un token bucket encima del semáforo. Campo `rate_limit_per_second` reservado y documentado como punto de extensión.
+
+**Fórmula de capacidad:** `límite por réplica = techo de la fuente ÷ nº de réplicas`.
+
+---
+
+## Lecciones
+
+1. **El agente puede omitir cosas del resumen sin haberlas omitido del trabajo.** El campo de rate limit estaba implementado en 4 lugares pero no apareció en el reporte. Verificar contra el requisito, no contra el resumen.
+2. **Cuando el agente tiene el entorno completo, la calidad sube notablemente.** Con Docker disponible probó todo end-to-end y no quedaron pendientes de validación — contraste directo con la Fase 1.
+3. **Tests con reloj falso** para probar transiciones temporales (medio-abierto) en vez de `sleep`: rápidos y deterministas.
+
+---
+
+## Pendientes menores
+
+- [ ] Probar contra la instancia de Postgres 18 existente (`localhost:5433`), distinta a la del compose de desarrollo — verificar que funciona fuera de la burbuja del agente.
+- [ ] Evaluar si el fix de Windows debe moverse fuera de `main.py`.
+
+---
+
+## Siguiente
+
+**Fase 03 — Tools:** las primeras tools MCP por intención de negocio sobre los conectores, más las primitivas Resources y Prompts. Es donde el agente MCP por fin ve algo.

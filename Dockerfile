@@ -19,8 +19,10 @@ COPY pyproject.toml uv.lock README.md ./
 RUN uv sync --frozen --no-install-project --no-dev
 
 # Ahora sí el código fuente, e instalamos el propio paquete (sin dev deps).
+# --no-editable: la imagen final solo copia /opt/venv, no /app/src, así que
+# el paquete debe quedar instalado como copia real, no como enlace editable.
 COPY src ./src
-RUN uv sync --frozen --no-dev
+RUN uv sync --frozen --no-dev --no-editable
 
 # --- Etapa final: imagen slim, sin toolchain de build, usuario no-root ---
 FROM python:3.12-slim AS runtime

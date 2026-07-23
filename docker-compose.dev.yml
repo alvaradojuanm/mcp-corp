@@ -1,0 +1,26 @@
+# Postgres de desarrollo para probar el conector de la Fase 2 contra una
+# base real. NO es el stack de despliegue (eso es deploy/swarm/); esto es
+# solo para levantar localmente lo que necesita el test de integración de
+# `tests/connectors/test_postgres_integration.py`.
+#
+# Uso:
+#   docker compose -f docker-compose.dev.yml up -d
+#   uv run pytest tests/connectors/test_postgres_integration.py
+#   docker compose -f docker-compose.dev.yml down -v
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: mcp_corp
+      POSTGRES_PASSWORD: mcp_corp
+      POSTGRES_DB: mcp_corp
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./deploy/dev/postgres-seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mcp_corp -d mcp_corp"]
+      interval: 2s
+      timeout: 3s
+      retries: 10

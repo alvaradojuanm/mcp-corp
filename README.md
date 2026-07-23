@@ -5,11 +5,12 @@ repositorio es la **plantilla base** que se clonará para cada fuente de datos
 concreta; por eso esta fase prioriza claridad y solidez del andamiaje sobre
 velocidad de entrega.
 
-**Estado actual: Fase 2 — capa de conectores.** Fase 1 (andamiaje base)
-cerrada. Esta fase suma la infraestructura de resiliencia (concurrencia,
-timeout, circuit breaker) y un conector real de PostgreSQL sobre esa
-infraestructura. Todavía no hay tools MCP ni lógica de negocio: eso es la
-Fase 3.
+**Estado actual: Fase 3 — conector HTTP y primeras tools MCP.** Fases 1
+(andamiaje base) y 2 (capa de conectores + Postgres) cerradas. Esta fase
+suma un segundo conector, de naturaleza distinta (API REST vía HTTP,
+sobre la misma capa de resiliencia genérica de la Fase 2), y las primeras
+tools de negocio, un Resource y un Prompt — el camino completo
+agente → tool → conector → dato ya funciona de punta a punta.
 
 ## Qué es esto
 
@@ -90,10 +91,10 @@ El `HEALTHCHECK` de la imagen apunta a `/health`. Build, arranque y
 respuesta HTTP real (`curl /health` devolviendo `200` desde dentro del
 contenedor) fueron verificados en un entorno con Docker Desktop.
 
-## Cómo levantar Postgres de desarrollo (Fase 2)
+## Cómo levantar la infraestructura de desarrollo (Postgres + stub de saldos)
 
-Para probar el conector de Postgres localmente (fuera de los tests, que ya
-lo hacen por su cuenta):
+Para probar los conectores de las Fases 2 y 3 localmente (fuera de los
+tests de integración, que ya lo hacen por su cuenta):
 
 ```bash
 docker compose -f docker-compose.dev.yml up -d
@@ -101,6 +102,8 @@ docker compose -f docker-compose.dev.yml up -d
 # En tu .env:
 # MCP_CORP_POSTGRES__ENABLED=true
 # MCP_CORP_POSTGRES__DSN=postgresql://mcp_corp:mcp_corp@localhost:5432/mcp_corp
+# MCP_CORP_SALDO_API__ENABLED=true
+# MCP_CORP_SALDO_API__BASE_URL=http://localhost:8080
 
 uv run python -m mcp_corp
 curl -s http://localhost:8000/diagnostics | jq
@@ -108,10 +111,110 @@ curl -s http://localhost:8000/diagnostics | jq
 docker compose -f docker-compose.dev.yml down -v
 ```
 
-Ver [`docker-compose.dev.yml`](docker-compose.dev.yml) y los datos semilla
-en [`deploy/dev/postgres-seed.sql`](deploy/dev/postgres-seed.sql). Esto es
+`docker compose ... down -v` es importante si cambiaste el seed: Postgres
+solo corre `docker-entrypoint-initdb.d` en un volumen de datos vacío, así
+que sin el `-v` una recreación del contenedor NO vuelve a sembrar la base
+(la tabla `clientes` nueva de esta fase no aparecía hasta hacer el `-v`).
+
+Ver [`docker-compose.dev.yml`](docker-compose.dev.yml), el seed de
+Postgres en [`deploy/dev/postgres-seed.sql`](deploy/dev/postgres-seed.sql)
+y el stub de saldos en
+[`deploy/dev/saldo_api_stub.py`](deploy/dev/saldo_api_stub.py). Esto es
 solo para desarrollo local; no es el stack de despliegue (eso sigue siendo
 `deploy/swarm/`).
+
+## Tools, Resource y Prompt (Fase 3)
+
+Con la infraestructura de desarrollo arriba (Postgres + stub de saldos) y
+el server corriendo con ambos conectores habilitados, cualquier cliente
+MCP puede invocar lo siguiente contra `http://localhost:8000/mcp`:
+
+### Las tres tools
+
+| Tool | Fuente | Parámetro | Devuelve |
+|---|---|---|---|
+| `consultar_cliente` | PostgreSQL (`clientes`) | `cedula: str` (6-10 dígitos) | `{cedula, nombre, email, estado}` |
+| `consultar_saldo` | API REST de saldos (stub) | `cedula: str` (6-10 dígitos) | `{cedula, saldo, moneda}` |
+| `resumen_cliente` | ambas, en paralelo | `cedula: str` (6-10 dígitos) | ver "Política de resultado parcial" abajo |
+
+`consultar_cliente` y `consultar_saldo` fallan limpio (`ToolError`, mensaje
+de negocio) si la cédula no existe o si su fuente no está disponible.
+`resumen_cliente` es la tool compuesta preferida cuando se necesitan ambos
+datos: una sola llamada, ambas fuentes consultadas en paralelo con
+`asyncio.TaskGroup`.
+
+Cédulas de prueba (ver el seed): `1000000001` y `1000000002` existen en
+ambas fuentes (caso feliz); `1000000003` existe solo en Postgres (para
+probar el resultado parcial); `5555555555` existe en Postgres y hace que
+el stub de saldos responda `500` (para probar el circuit breaker con un
+fallo real de infraestructura, no un simple "no encontrado").
+
+### Política de resultado parcial de `resumen_cliente`
+
+Si una de las dos fuentes no está disponible (circuito abierto, timeout,
+fallo de infraestructura), la tool **no falla entera**: devuelve lo que sí
+pudo obtener y marca explícitamente qué falta y por qué.
+
+```json
+{
+  "cedula": "1000000003",
+  "cliente": {"disponible": true, "datos": {"...": "..."}, "motivo": null},
+  "saldo": {"disponible": false, "datos": null, "motivo": "el servicio de saldos no está disponible en este momento"},
+  "resumen_completo": false
+}
+```
+
+Un modelo que consuma esta tool debe revisar siempre `cliente.disponible`
+/ `saldo.disponible` antes de usar `datos` — un dato ausente NUNCA es cero
+ni un valor válido. El Prompt `atencion_cliente` (ver abajo) codifica esta
+regla explícitamente para el flujo de atención al cliente.
+
+### Resource: catálogo de estados de cliente
+
+`data://clientes/estados` — un diccionario JSON de solo lectura con el
+significado de cada código de `estado` (`activo`, `moroso`, `inactivo`)
+que puede traer `consultar_cliente` / `resumen_cliente`.
+
+**Diferencia entre Tool y Resource:** una Tool es una ACCIÓN que el modelo
+decide invocar (con efectos — en este caso, consultar una fuente externa
+en el momento). Un Resource es CONTEXTO de solo lectura que la aplicación
+cliente puede cargar sin que el modelo gaste un turno de tool-call — p.
+ej. para mostrarlo en una UI, o para que el modelo lo tenga ya disponible
+al interpretar el campo `estado` de un cliente.
+
+### Prompt: flujo de atención al cliente
+
+`atencion_cliente(cedula)` — una plantilla de workflow reutilizable que le
+dice al modelo, en orden: usar `resumen_cliente` primero, revisar los
+campos `disponible` antes de reportar nada, no inventar datos faltantes, y
+cuándo usar las tools individuales o el Resource de estados en su lugar.
+
+### Probar todo de punta a punta
+
+```bash
+docker compose -f docker-compose.dev.yml up -d
+# .env con MCP_CORP_POSTGRES__ENABLED=true y MCP_CORP_SALDO_API__ENABLED=true
+uv run python -m mcp_corp
+```
+
+Con el server corriendo, usando el cliente de `fastmcp` (incluido como
+dependencia transitiva):
+
+```python
+import asyncio
+from fastmcp import Client
+
+async def main():
+    async with Client("http://localhost:8000/mcp") as client:
+        print(await client.list_tools())
+        print(await client.call_tool("resumen_cliente", {"cedula": "1000000001"}))
+
+asyncio.run(main())
+```
+
+O ejecuta directamente `uv run pytest tests/tools/` (unitarios sin
+infraestructura + integración contra el stack real, se saltan solos si no
+está levantado).
 
 ## Cómo desplegarlo en Docker Swarm
 
@@ -134,23 +237,32 @@ ejemplo. **Nunca** commitees un `.env` real: está excluido en `.gitignore`.
 ```
 src/mcp_corp/
 ├── main.py                    # entrypoint: python -m mcp_corp
-├── server.py                  # FastMCP server: /health, /ready, /diagnostics, lifecycle
-├── config.py                  # configuración vía pydantic-settings (incluye PostgresSettings)
+├── server.py                  # FastMCP server: /health, /ready, /diagnostics, tools/resource/prompt, lifecycle
+├── config.py                  # configuración vía pydantic-settings (Postgres + saldo_api)
 ├── logging_setup.py           # logging JSON estructurado a stdout
+├── audit.py                   # auditoría por invocación de tool (correlation id + enmascaramiento)
+├── tools.py                   # las 3 tools de negocio + Resource + Prompt (Fase 3)
 └── connectors/
     ├── base.py                # protocolo Connector: connect/close/health/run
     ├── resilience.py          # capa genérica: semáforo + timeout + circuit breaker
     ├── registry.py            # ciclo de vida y diagnóstico agregado de conectores
-    └── postgres.py            # conector concreto: psycopg3 + psycopg_pool
+    ├── postgres.py            # conector concreto: psycopg3 + psycopg_pool
+    └── http.py                 # conector concreto: httpx.AsyncClient (Fase 3)
 
-tests/connectors/
-├── test_resilience.py             # unitarios de la capa de resiliencia (conector falso)
-└── test_postgres_integration.py   # integración contra Postgres real (docker-compose.dev.yml)
+tests/
+├── test_audit.py                       # unitarios de auditoría: enmascaramiento, forma del log
+├── connectors/
+│   ├── test_resilience.py              # unitarios de la capa de resiliencia (conector falso)
+│   ├── test_postgres_integration.py    # integración contra Postgres real
+│   └── test_http.py                    # unitarios del conector HTTP (transporte falso)
+└── tools/
+    ├── test_tools_logic.py             # unitarios de las tools: parcial, fuente caída, sin internals
+    └── test_tools_integration.py       # integración contra Postgres + stub de saldos reales
 
 deploy/
-├── swarm/              # docker-compose.yml para Docker Swarm/Portainer
-├── dev/                 # postgres-seed.sql para docker-compose.dev.yml
-└── openshift/           # placeholder — manifiestos K8s en otra fase
+├── swarm/                 # docker-compose.yml para Docker Swarm/Portainer
+├── dev/                    # postgres-seed.sql + saldo_api_stub.py para docker-compose.dev.yml
+└── openshift/              # placeholder — manifiestos K8s en otra fase
 ```
 
 ## Decisiones de diseño
@@ -309,12 +421,105 @@ con muy poco código, y es el enfoque estándar en el ecosistema FastMCP/
 Pydantic. Toda variable nueva que se necesite en fases futuras se añade
 como un campo más en `Settings`, reflejado también en `.env.example`.
 
+### Fase 3 — conector HTTP y tools de negocio
+
+**El conector HTTP valida la abstracción de la Fase 2 contra algo que no es Postgres.**
+`connectors/http.py` implementa el mismo protocolo `Connector` (`connect`,
+`close`, `health`, `run`) y se envuelve con el mismo `ResilientExecutor`,
+sin que la capa de resiliencia sepa que esta vez el recurso subyacente es
+un `httpx.AsyncClient` en vez de un pool de psycopg. No hizo falta tocar
+`resilience.py` ni `base.py` para nada: la abstracción de la Fase 2 no
+resultó forzada — de hecho salió MÁS simple que el conector de Postgres,
+porque no hay un pool que administrar a mano (`httpx.AsyncClient` ya trae
+el suyo internamente). Eso es justamente la señal de que el diseño de la
+Fase 2 estaba bien encontrado, no una casualidad.
+
+**¿Por qué `httpx==0.28.1` como dependencia directa (y no solo transitiva)?**
+Ya era una dependencia transitiva de `fastmcp`/`mcp` desde la Fase 1 (por
+eso la versión coincide exactamente); pasa a dependencia directa en esta
+fase porque `connectors/http.py` la usa en tiempo de ejecución, no solo en
+tests. Se quita de `dev` en `pyproject.toml` para no declararla dos veces.
+
+**¿Qué cuenta como fallo de infraestructura para una fuente HTTP?**
+`HTTP_INFRA_EXCEPTIONS = (httpx.TransportError, httpx.HTTPStatusError)` en
+`connectors/http.py`. `TransportError` cubre problemas reales de red/
+conexión/timeout de transporte. `HTTPStatusError` solo se levanta cuando
+el código de la tool llama a `response.raise_for_status()` — y las tools
+de esta fase manejan el `404` ("cédula no encontrada") como caso de
+NEGOCIO antes de llegar ahí, devolviendo `None` en vez de lanzar. Así que
+lo que efectivamente cuenta como fallo de infraestructura es un `5xx` real
+del servicio, no un simple "no encontrado".
+
+**Tools por intención de negocio, no una por endpoint.**
+Tres tools (`consultar_cliente`, `consultar_saldo`, `resumen_cliente`), no
+una por cada endpoint de cada fuente. Un server con demasiadas tools
+parecidas degrada la capacidad del modelo de elegir bien cuál usar — este
+es el motivo documentado de que se evitó deliberadamente una tool por
+endpoint. Las descripciones de cada tool son la interfaz real que lee el
+modelo: dicen explícitamente cuándo usar esa tool y cuándo usar otra en su
+lugar (p. ej. "si también necesitas el saldo, usa `resumen_cliente` en su
+lugar").
+
+**Resultado parcial explícito en `resumen_cliente`, nunca fallo total.**
+Ver "Política de resultado parcial" arriba. La razón de fondo: un modelo
+que recibe un error genérico cuando una de dos fuentes falla no puede
+decirle al usuario "tengo el dato del cliente pero no el saldo ahora
+mismo" — se queda sin nada que podía haber tenido. Ambas ramas de
+`_resumen_cliente_logic` atrapan sus propios `ConnectorError` (nunca dejan
+escapar una excepción "esperada"); solo un bug real y no contemplado
+propagaría una excepción fuera de la tool, y ahí sí queremos que falle
+fuerte en vez de fingir un resultado parcial.
+
+**¿Por qué `asyncio.TaskGroup` y no `asyncio.gather` en la tool compuesta?**
+Misma razón que en la Fase 2: `gather` deja tareas huérfanas corriendo si
+una falla; `TaskGroup` las cancela. Aquí, además, ninguna de las dos tareas
+internas deja escapar una excepción esperada (la atrapan y la traducen a
+`disponible=False`), así que `TaskGroup` casi nunca tiene que cancelar
+nada en la práctica — pero es la primitiva correcta igual, para el día en
+que sí aparezca un bug real que deba cancelar a la tarea hermana.
+
+**Errores hacia el modelo: `ToolError` + `mask_error_details=True`, dos capas.**
+Cada tool atrapa `ConnectorError` (ya sanitizado por `resilience.py`: su
+mensaje nunca incluye el DSN, el SQL ni el string de la excepción
+original) y lo traduce a un `ToolError` con un mensaje de negocio propio,
+escrito a mano — nunca `str(excepción_original)`. Como defensa en
+profundidad adicional, el server se crea con
+`FastMCP(..., mask_error_details=True)`: cualquier excepción que NO sea un
+`ToolError` (es decir, un bug no contemplado) se enmascara automáticamente
+hacia el cliente en vez de reenviar el traceback completo.
+
+**Criterio de enmascaramiento en el log de auditoría (`audit.py`).**
+Cada invocación de tool queda en el log JSON con: `correlation_id` (nuevo
+por invocación, reutilizando el mecanismo que ya existía desde la Fase 1),
+nombre de la tool, `duration_ms`, y `result` (`success` / `partial` /
+`failure`, con `reason` si falló). Lo que NUNCA se registra es el VALOR de
+los parámetros de negocio: una cédula, nombre o saldo en claro en un log
+que viaja a un agregador externo es, en sí mismo, un problema de
+cumplimiento. Lo único que se conserva del identificador principal (la
+cédula) es un hash truncado (`sha256`, 12 hex) — permite correlacionar
+invocaciones del mismo cliente entre líneas de log sin poder recuperar el
+valor original a partir del log.
+
+**Hallazgo importante: el `JSONFormatter` de la Fase 1 ignoraba `extra={}`.**
+Al validar el log de auditoría de punta a punta se descubrió que
+`logging_setup.JSONFormatter` (desde la Fase 1) solo incluía
+`correlation_id` en el JSON — cualquier otro campo pasado vía
+`logger.info(msg, extra={...})` se registraba en el `LogRecord` pero
+JAMÁS se escribía en la línea de log final. Esto afectaba TODOS los logs
+estructurados desde la Fase 2 (`source`, `circuit_state`, etc.), no solo
+los de esta fase; se corrigió volcando cualquier atributo del `LogRecord`
+que no sea uno de los estándar de `logging`. Verificado manualmente
+comparando el log antes/después del fix contra el mismo flujo de tools.
+
+**Prompt y Resource: mismo patrón de registro que las tools, sin resiliencia.**
+Ninguno de los dos toca una fuente externa en el momento (el Resource es
+un diccionario estático en memoria; el Prompt es una plantilla de texto),
+así que no pasan por `ResilientExecutor` — no tienen de qué protegerse.
+
 ## Próximas fases (fuera de alcance aquí)
 
-- Fase 3+: tools MCP por intención de negocio sobre los conectores de la
-  Fase 2, gateway de gobierno.
-- Conectores adicionales (APIs REST, sistemas legacy) sobre el mismo
-  protocolo `Connector` / `ResilientExecutor`.
+- Fase 4+: gateway de gobierno, más tools de negocio, más conectores
+  (sistemas legacy) sobre el mismo protocolo `Connector` / `ResilientExecutor`.
 - Token bucket para límite de tasa (req/s) por fuente — hoy solo hay
   límite de concurrencia (ver `rate_limit_per_second` en `config.py`).
 - Estado del circuit breaker compartido entre réplicas (hoy es por

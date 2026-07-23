@@ -91,13 +91,20 @@ async def saldo_executor() -> AsyncIterator[ResilientExecutor]:
 
 
 async def test_consultar_cliente_real(postgres_executor: ResilientExecutor) -> None:
-    result = await _consultar_cliente_logic("1000000001", postgres_executor)
+    result = await _consultar_cliente_logic("V16760320", postgres_executor)
     assert result["nombre"] == "Ana María Restrepo"
     assert result["estado"] == "activo"
 
 
+async def test_consultar_cliente_real_formato_con_puntos_y_guiones(postgres_executor: ResilientExecutor) -> None:
+    # Mismo cliente que arriba, formato distinto: prueba la normalización
+    # de punta a punta contra Postgres real, no solo en unitarios.
+    result = await _consultar_cliente_logic("V-16.760.320", postgres_executor)
+    assert result["nombre"] == "Ana María Restrepo"
+
+
 async def test_consultar_saldo_real(saldo_executor: ResilientExecutor) -> None:
-    result = await _consultar_saldo_logic("1000000001", saldo_executor)
+    result = await _consultar_saldo_logic("V16760320", saldo_executor)
     assert result["saldo"] == 1500000.50
     assert result["moneda"] == "COP"
 
@@ -105,7 +112,7 @@ async def test_consultar_saldo_real(saldo_executor: ResilientExecutor) -> None:
 async def test_resumen_cliente_real_caso_feliz(
     postgres_executor: ResilientExecutor, saldo_executor: ResilientExecutor
 ) -> None:
-    result = await _resumen_cliente_logic("1000000001", postgres_executor, saldo_executor)
+    result = await _resumen_cliente_logic("16.760.320", postgres_executor, saldo_executor)
     assert result["resumen_completo"] is True
     assert result["cliente"]["datos"]["nombre"] == "Ana María Restrepo"
     assert result["saldo"]["datos"]["saldo"] == 1500000.50
@@ -114,9 +121,9 @@ async def test_resumen_cliente_real_caso_feliz(
 async def test_resumen_cliente_real_parcial_sin_saldo(
     postgres_executor: ResilientExecutor, saldo_executor: ResilientExecutor
 ) -> None:
-    # 1000000003 existe en Postgres pero NO en el stub de saldos (a
+    # V16760322 existe en Postgres pero NO en el stub de saldos (a
     # propósito, ver deploy/dev/postgres-seed.sql y saldo_api_stub.py).
-    result = await _resumen_cliente_logic("1000000003", postgres_executor, saldo_executor)
+    result = await _resumen_cliente_logic("V16760322", postgres_executor, saldo_executor)
     assert result["resumen_completo"] is False
     assert result["cliente"]["disponible"] is True
     assert result["saldo"]["disponible"] is False
@@ -125,9 +132,9 @@ async def test_resumen_cliente_real_parcial_sin_saldo(
 async def test_resumen_cliente_real_saldo_api_error_simulado(
     postgres_executor: ResilientExecutor, saldo_executor: ResilientExecutor
 ) -> None:
-    # La cédula reservada 5555555555 hace que el stub responda 500 (fallo
+    # La cédula reservada V90000001 hace que el stub responda 500 (fallo
     # real de infraestructura, no "no encontrado"): debe marcar el saldo
     # como no disponible sin tumbar la tool ni filtrar el 500 al resultado.
-    result = await _resumen_cliente_logic("5555555555", postgres_executor, saldo_executor)
+    result = await _resumen_cliente_logic("V90000001", postgres_executor, saldo_executor)
     assert result["saldo"]["disponible"] is False
     assert result["saldo"]["motivo"] == "el servicio de saldos no está disponible en este momento"

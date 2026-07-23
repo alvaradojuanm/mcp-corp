@@ -13,9 +13,12 @@ Endpoints:
                                para poder probar el circuit breaker contra
                                un fallo real de infraestructura.
 
-Las cédulas 1000000001 y 1000000002 coinciden con las del seed de
-Postgres (`deploy/dev/postgres-seed.sql`) a propósito, para que
-`resumen_cliente` cuadre en el caso feliz.
+Las cédulas V16760320 y V16760321 coinciden con las del seed de Postgres
+(`deploy/dev/postgres-seed.sql`) a propósito, para que `resumen_cliente`
+cuadre en el caso feliz. Los identificadores que llegan aquí ya vienen en
+forma canónica corta (prefijo + 8 dígitos, sin dígito verificador) porque
+`tools.py` normaliza antes de invocar el conector — este stub no sabe nada
+de formatos con puntos, guiones ni dígito verificador.
 """
 
 from __future__ import annotations
@@ -25,13 +28,13 @@ import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 SALDOS: dict[str, dict[str, object]] = {
-    "1000000001": {"cedula": "1000000001", "saldo": 1500000.50, "moneda": "COP"},
-    "1000000002": {"cedula": "1000000002", "saldo": 320000.00, "moneda": "COP"},
+    "V16760320": {"cedula": "V16760320", "saldo": 1500000.50, "moneda": "COP"},
+    "V16760321": {"cedula": "V16760321", "saldo": 320000.00, "moneda": "COP"},
 }
 
-CEDULA_ERROR_SIMULADO = "5555555555"
+CEDULA_ERROR_SIMULADO = "V90000001"
 
-SALDO_PATH = re.compile(r"^/saldos/(?P<cedula>\d+)$")
+SALDO_PATH = re.compile(r"^/saldos/(?P<cedula>[A-Z0-9]+)$")
 
 
 class Handler(BaseHTTPRequestHandler):

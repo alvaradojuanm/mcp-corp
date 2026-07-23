@@ -5,12 +5,12 @@ repositorio es la **plantilla base** que se clonará para cada fuente de datos
 concreta; por eso esta fase prioriza claridad y solidez del andamiaje sobre
 velocidad de entrega.
 
-**Estado actual: Fase 3 — conector HTTP y primeras tools MCP.** Fases 1
-(andamiaje base) y 2 (capa de conectores + Postgres) cerradas. Esta fase
-suma un segundo conector, de naturaleza distinta (API REST vía HTTP,
-sobre la misma capa de resiliencia genérica de la Fase 2), y las primeras
-tools de negocio, un Resource y un Prompt — el camino completo
-agente → tool → conector → dato ya funciona de punta a punta.
+**Estado actual: Fase 4 (Parte A) — identificadores venezolanos.** Fases 1
+(andamiaje base), 2 (capa de conectores + Postgres) y 3 (conector HTTP +
+tools MCP + auditoría) cerradas. Esta parte suma normalización y
+validación de cédulas/RIF venezolanos (`identifiers.py`), para que las
+tools acepten el formato que de verdad escribe un usuario, no solo dígitos
+limpios. La Parte B (despliegue y escalado horizontal) sigue en curso.
 
 ## Qué es esto
 
@@ -123,7 +123,7 @@ y el stub de saldos en
 solo para desarrollo local; no es el stack de despliegue (eso sigue siendo
 `deploy/swarm/`).
 
-## Tools, Resource y Prompt (Fase 3)
+## Tools, Resource y Prompt (Fases 3 y 4)
 
 Con la infraestructura de desarrollo arriba (Postgres + stub de saldos) y
 el server corriendo con ambos conectores habilitados, cualquier cliente
@@ -133,21 +133,65 @@ MCP puede invocar lo siguiente contra `http://localhost:8000/mcp`:
 
 | Tool | Fuente | Parámetro | Devuelve |
 |---|---|---|---|
-| `consultar_cliente` | PostgreSQL (`clientes`) | `cedula: str` (6-10 dígitos) | `{cedula, nombre, email, estado}` |
-| `consultar_saldo` | API REST de saldos (stub) | `cedula: str` (6-10 dígitos) | `{cedula, saldo, moneda}` |
-| `resumen_cliente` | ambas, en paralelo | `cedula: str` (6-10 dígitos) | ver "Política de resultado parcial" abajo |
+| `consultar_cliente` | PostgreSQL (`clientes`) | `identificador: str` (ver formatos abajo) | `{cedula, nombre, email, estado}` |
+| `consultar_saldo` | API REST de saldos (stub) | `identificador: str` | `{cedula, saldo, moneda}` |
+| `resumen_cliente` | ambas, en paralelo | `identificador: str` | ver "Política de resultado parcial" abajo |
 
 `consultar_cliente` y `consultar_saldo` fallan limpio (`ToolError`, mensaje
-de negocio) si la cédula no existe o si su fuente no está disponible.
-`resumen_cliente` es la tool compuesta preferida cuando se necesitan ambos
-datos: una sola llamada, ambas fuentes consultadas en paralelo con
-`asyncio.TaskGroup`.
+de negocio) si el identificador no existe o si su fuente no está
+disponible. `resumen_cliente` es la tool compuesta preferida cuando se
+necesitan ambos datos: una sola llamada, ambas fuentes consultadas en
+paralelo con `asyncio.TaskGroup`.
 
-Cédulas de prueba (ver el seed): `1000000001` y `1000000002` existen en
-ambas fuentes (caso feliz); `1000000003` existe solo en Postgres (para
-probar el resultado parcial); `5555555555` existe en Postgres y hace que
-el stub de saldos responda `500` (para probar el circuit breaker con un
-fallo real de infraestructura, no un simple "no encontrado").
+Identificadores de prueba (ver el seed): `V16760320` y `V16760321` existen
+en ambas fuentes (caso feliz) — pueden escribirse también como
+`16760320`, `16.760.320`, `V-16.760.320`, etc. (ver "Identificadores
+venezolanos" abajo); `V16760322` existe solo en Postgres (para probar el
+resultado parcial); `V90000001` existe en Postgres y hace que el stub de
+saldos responda `500` (para probar el circuit breaker con un fallo real
+de infraestructura, no un simple "no encontrado").
+
+### Identificadores venezolanos: formatos aceptados (Fase 4)
+
+Las tres tools aceptan cédula o RIF venezolano en cualquier formato común
+— la normalización vive en [`identifiers.py`](src/mcp_corp/identifiers.py),
+no en el esquema de la tool ni en el modelo. El modelo no necesita limpiar
+la entrada del usuario antes de pasarla.
+
+**Formatos equivalentes** (todos normalizan al mismo valor canónico):
+
+```
+Cédula:  16760320      16.760.320      V16760320
+         V-16760320    V-16.760.320    v16760320
+RIF:     J-167603200   J16.760.320-0   J-16760320-0
+```
+
+Con o sin puntos de millar, con o sin guiones, con o sin letra de
+prefijo, mayúscula o minúscula.
+
+**Prefijos aceptados: `V`, `E`, `J`, `G`, `P`** — verificados contra
+fuentes (ver "Decisiones de diseño" para el detalle y las fuentes
+consultadas). `C` (comunas/consejos comunales) existe pero es ambiguo
+entre fuentes; queda deshabilitado por defecto, activable con
+`MCP_CORP_IDENTIFIERS__INCLUIR_PREFIJO_C=true`.
+
+**La letra `I` NO es un prefijo válido** y se rechaza explícitamente —
+varias librerías y regex publicados la incluyen por error; el registro
+oficial del SENIAT no la contempla.
+
+**Dígito verificador del RIF:** cuando el identificador trae uno (un RIF
+completo, no solo una cédula), se valida contra la fórmula módulo 11 del
+SENIAT ANTES de tocar cualquier conector — un identificador mal tipeado
+se rechaza sin gastar un slot del semáforo ni abrir una conexión.
+Desactivable con `MCP_CORP_IDENTIFIERS__VALIDAR_DIGITO_VERIFICADOR=false`
+si alguna vez hiciera falta (ver "Decisiones de diseño" para cómo se
+verificó el algoritmo).
+
+Un identificador con formato irreconocible, con un prefijo no válido, o
+(si la validación está activa) con un dígito verificador que no coincide,
+produce un `ToolError` de negocio ("el identificador no tiene un formato
+reconocido" / "el dígito verificador no es válido") — nunca un error
+técnico, y nunca después de haber tocado Postgres o la API de saldos.
 
 ### Política de resultado parcial de `resumen_cliente`
 
@@ -157,7 +201,7 @@ pudo obtener y marca explícitamente qué falta y por qué.
 
 ```json
 {
-  "cedula": "1000000003",
+  "identificador": "V16760322",
   "cliente": {"disponible": true, "datos": {"...": "..."}, "motivo": null},
   "saldo": {"disponible": false, "datos": null, "motivo": "el servicio de saldos no está disponible en este momento"},
   "resumen_completo": false
@@ -207,7 +251,7 @@ from fastmcp import Client
 async def main():
     async with Client("http://localhost:8000/mcp") as client:
         print(await client.list_tools())
-        print(await client.call_tool("resumen_cliente", {"cedula": "1000000001"}))
+        print(await client.call_tool("resumen_cliente", {"identificador": "V-16.760.320"}))
 
 asyncio.run(main())
 ```
@@ -242,6 +286,7 @@ src/mcp_corp/
 ├── logging_setup.py           # logging JSON estructurado a stdout
 ├── audit.py                   # auditoría por invocación de tool (correlation id + enmascaramiento)
 ├── tools.py                   # las 3 tools de negocio + Resource + Prompt (Fase 3)
+├── identifiers.py             # normalización/validación de cédula-RIF venezolano (Fase 4)
 └── connectors/
     ├── base.py                # protocolo Connector: connect/close/health/run
     ├── resilience.py          # capa genérica: semáforo + timeout + circuit breaker
@@ -251,6 +296,7 @@ src/mcp_corp/
 
 tests/
 ├── test_audit.py                       # unitarios de auditoría: enmascaramiento, forma del log
+├── test_identifiers.py                 # unitarios de normalización/checksum (Fase 4)
 ├── connectors/
 │   ├── test_resilience.py              # unitarios de la capa de resiliencia (conector falso)
 │   ├── test_postgres_integration.py    # integración contra Postgres real
@@ -551,6 +597,86 @@ comparando el log antes/después del fix contra el mismo flujo de tools.
 Ninguno de los dos toca una fuente externa en el momento (el Resource es
 un diccionario estático en memoria; el Prompt es una plantilla de texto),
 así que no pasan por `ResilientExecutor` — no tienen de qué protegerse.
+
+### Fase 4, Parte A — identificadores venezolanos
+
+**¿Por qué normalizar en el servidor y no exigirle el formato limpio al modelo?**
+Un usuario le escribe al agente "consúltame la cédula V-16.760.320", no
+"16760320". Si la tool exige dígitos limpios, el modelo tiene que adivinar
+cómo limpiar la entrada — y si adivina distinto de cómo lo hace nuestro
+código, la tool falla antes de tocar ninguna fuente por una razón que no
+tiene nada que ver con si el cliente existe. La normalización es
+responsabilidad del servidor, no del modelo: `identifiers.py` acepta el
+formato tal como lo escribe una persona.
+
+**¿Por qué un módulo dedicado (`identifiers.py`) y no dentro de `tools.py`?**
+Es lógica de dominio (reglas del SENIAT) sin ninguna dependencia de
+FastMCP, de un conector ni de resiliencia — se puede probar y razonar
+sobre ella de forma completamente aislada. `tools.py` la importa y la usa,
+pero no la conoce por dentro.
+
+**El algoritmo del dígito verificador: cómo se verificó.**
+Se cruzaron tres implementaciones independientes y no relacionadas entre
+sí — un gist de la lista python-venezuela, el paquete `joseayram/utils`
+en PHP, y la librería `django-localflavor-ve` (usada en producción por
+proyectos Django venezolanos) — y las tres coinciden EXACTAMENTE en la
+fórmula: peso por posición `(3, 2, 7, 6, 5, 4, 3, 2)` sobre los 8 dígitos
+del número, más un valor base por letra (`V=4, E=8, J=12, P=16, G=20`),
+todo módulo 11. Como confirmación final, se encontró un ejemplo real
+citado como correcto en una fuente independiente
+(`V-13222105-3`, documento "Cálculo Dígito verificador RIF Venezuela",
+marcado "Rif correcto") y se reprodujo el cálculo exacto con esta
+implementación: suma = 63, residuo = 8, verificador = 11 − 8 = 3. Con esa
+triple coincidencia de código más un ejemplo real verificado, **se activó
+el checksum por defecto** (`validar_digito_verificador=True`) — no quedó
+detrás de un flag apagado, porque sí se logró la confianza que pedía el
+encargo. Sigue siendo desactivable (`MCP_CORP_IDENTIFIERS__VALIDAR_DIGITO_VERIFICADOR=false`)
+por si en producción aparece un caso real que la fórmula no contemple.
+
+**La letra `I` no es un prefijo válido — trampa conocida, verificada y evitada.**
+Ninguna de las fuentes oficiales ni las tres implementaciones cruzadas
+incluye `I` como prefijo. Sí aparece en algunos regex y librerías de
+validación de terceros, heredado de un error que se propaga por copia
+entre proyectos. `identifiers.py` solo acepta `V, E, J, G, P` por defecto,
+y hay un test de regresión explícito (`test_letra_i_es_rechazada_no_existe_en_el_seniat`)
+para que nadie la reintroduzca sin darse cuenta.
+
+**El prefijo `C`: activable, no cableado.**
+Existe desde un anuncio oficial de 2015 para comunas, consejos comunales
+y organizaciones del Poder Popular. Pero a diferencia de `V/E/J/G/P`, no
+se encontró consenso entre las fuentes consultadas sobre si sigue vigente
+en el set que valida el portal actual del SENIAT, ni una fórmula de
+dígito verificador confirmada por más de una fuente para esta letra (solo
+`joseayram/utils` la documenta, compartiendo el valor de `J`). Por esa
+doble incertidumbre queda deshabilitada por defecto
+(`MCP_CORP_IDENTIFIERS__INCLUIR_PREFIJO_C=false`) y solo se activa
+explícitamente.
+
+**Relación cédula/RIF: no son dos números independientes.**
+Para personas naturales (prefijo `V`), los 8 dígitos del RIF SON el
+número de cédula — no hay dos identificadores distintos que reconciliar.
+Por eso `IdentidadFiscal` guarda un solo `numero` de 8 dígitos y expone
+`.cedula` (forma corta, sin verificador) y `.rif` (forma completa, exige
+verificador) como dos VISTAS del mismo dato, no como dos campos separados.
+
+**Relleno con cero.**
+Un identificador con menos de 8 dígitos (cédulas antiguas más cortas) se
+completa con ceros a la izquierda hasta 8 — `identidad.numero.zfill(8)`.
+`"123456"` normaliza a `"00123456"`.
+
+**Cada conector adapta la forma canónica a lo que necesita su fuente.**
+`tools.py` normaliza una sola vez (`identidad = normalizar(...)`) y pasa
+`identidad.cedula` a Postgres y a la API de saldos — en esta fase ambas
+fuentes usan la misma forma corta, pero el punto de extensión ya existe:
+un conector futuro que necesite el RIF completo con verificador usaría
+`identidad.rif` en su lugar, sin que el resto del código cambie.
+
+**Rechazo sin tocar ninguna fuente: la razón de ser en el diseño de resiliencia.**
+`_resolve_identidad()` corre ANTES de cualquier `ResilientExecutor.run()`.
+Un identificador mal tipeado nunca reserva un slot del semáforo ni abre
+una conexión del pool — es el filtro más barato posible, y en un sistema
+donde cada fuente tiene un techo de concurrencia finito, filtrar temprano
+importa.
 
 ## Próximas fases (fuera de alcance aquí)
 

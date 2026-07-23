@@ -9,8 +9,25 @@
 #
 # Requiere una red overlay externa llamada "traefik-public" con Traefik
 # corriendo como el edge router del swarm (patrón estándar de Portainer).
-
-version: "3.9"
+#
+# --- Cómo escalar réplicas desde Portainer ---
+# Stacks → mcp-corp → Services → mcp-corp → "Scale service" (o edita
+# `deploy.replicas` abajo y vuelve a desplegar el stack). Portainer aplica
+# el cambio como una actualización rolling: Traefik deja de enrutarle
+# tráfico nuevo a las réplicas que se retiran (gracias a
+# `update_config.order: start-first` de abajo, las nuevas arrancan y pasan
+# su healthcheck ANTES de que se apaguen las viejas) y cada una drena sus
+# peticiones en curso durante `MCP_CORP_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS`
+# antes de terminar. Ver "Verificaciones bajo carga" en el README para los
+# números reales medidos en esta secuencia.
+#
+# --- Fórmula de capacidad al escalar (ver README para el detalle) ---
+# Si activas los conectores (Postgres, API de saldos) en este stack, el
+# `max_concurrency` de cada uno se configura POR RÉPLICA:
+#   límite por réplica = techo de la fuente ÷ número de réplicas
+# Súbelo o bájalo cada vez que cambies `deploy.replicas`, o te arriesgas a
+# ahogar la fuente (si subes réplicas sin bajar el límite) o a
+# desperdiciar capacidad (si haces lo contrario).
 
 services:
   mcp-corp:
@@ -22,6 +39,14 @@ services:
       MCP_CORP_PORT: "8000"
       MCP_CORP_LOG_LEVEL: INFO
       MCP_CORP_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS: "10"
+      # OBLIGATORIO con MCP_CORP_ENVIRONMENT=production (fail-closed desde
+      # la Fase 4, Parte B: ver config.py). NO pongas el valor real aquí —
+      # este archivo se versiona. Cárgalo en Portainer como variable de
+      # entorno del stack (o como Docker secret si tu versión de Portainer
+      # lo soporta) y referencia esa variable al desplegar. Debe ser IGUAL
+      # en todas las réplicas. Genera uno con:
+      #   python -c "import secrets; print(secrets.token_hex(32))"
+      MCP_CORP_AUDIT_HMAC_SECRET: "${MCP_CORP_AUDIT_HMAC_SECRET:?la variable de entorno MCP_CORP_AUDIT_HMAC_SECRET es obligatoria en producción}"
     networks:
       - traefik-public
     healthcheck:

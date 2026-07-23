@@ -1,49 +1,149 @@
-# Fase 01 — Andamiaje base
+# Fase 01 — Andamiaje base del server MCP corporativo
 
-> Bitácora de trazabilidad: copia exacta del prompt que originó esta fase.
+| Campo | Valor |
+|---|---|
+| **Fase** | 01 |
+| **Objetivo** | Andamiaje base: estructura, config, logging, health/readiness, contenedor, deploy y Git. Sin tools ni conectores. |
+| **Rama de trabajo** | `claude/mcp-corp-phase-1-scaffold-9j7iaj` → integrado en `main` |
+| **Repo** | `github.com/alvaradojuanm/mcp-corp` |
+| **Stack** | FastMCP 3.4.4 · Python 3.12+ · uv · Streamable HTTP |
+| **Estado** | ✅ **CERRADA** |
+| **Fecha de cierre** | 23 de julio de 2026 |
+| **Versiones pineadas** | `fastmcp==3.4.4` · `uvicorn==0.35.0` |
 
-Eres mi copiloto de ingeniería en un proyecto nuevo. Vamos a construir la IMPLEMENTACIÓN DE REFERENCIA de un server MCP corporativo en Python. Este repo será la plantilla que luego clonaremos para múltiples fuentes de datos, así que la calidad y la claridad importan más que la velocidad. Trabajaremos POR FASES; esta es la FASE 1 y su único objetivo es el andamiaje base. NO implementes tools, conectores a datos, ni lógica de negocio todavía.
+---
 
-Contexto y norte (para que entiendas las decisiones, no para implementarlo ahora)
+## Resultado
 
-* El server usará FastMCP (paquete standalone `fastmcp`, versión 3.x) sobre transporte Streamable HTTP.
-* Debe ser STATELESS por invocación, para escalar horizontalmente por réplicas detrás de un balanceador (hoy Docker Swarm/Traefik en Portainer; destino final OpenShift/Kubernetes).
-* Diseño 12-factor: config por variables de entorno, logs a stdout, sin estado local en disco, apagado graceful ante SIGTERM.
-* Más adelante (otras fases) añadiremos: una capa de conectores donde cada fuente tiene su límite de concurrencia, timeout y circuit breaker; tools por intención de negocio; y un gateway de gobierno por encima. NADA de eso va en esta fase.
+Andamiaje completo, probado y documentado. `main` creada, empujada y establecida como rama por defecto. Historial con autoría 100 % `alvaradojuanm` vía correo noreply de GitHub.
 
-IMPORTANTE antes de escribir código
-La versión 3.0 de FastMCP fue una reescritura grande; tu conocimiento puede estar desactualizado. CONSULTA la documentación actual de FastMCP 3.x para confirmar la API correcta de: (1) creación del server, (2) ejecución con transporte Streamable HTTP, (3) cómo añadir rutas HTTP personalizadas (las necesito para health/readiness), y (4) hooks de ciclo de vida/lifespan para el shutdown. Si algo no lo puedes verificar, dímelo en vez de inventar.
-Alcance EXACTO de la Fase 1
-Crea esta estructura y nada más:
-mcp-corp/ ├── pyproject.toml # deps con uv, Python 3.12+, fastmcp 3.x PINEADO a versión exacta ├── .python-version ├── .gitignore # DEBE excluir .env, secrets, pycache, .venv, *.log, etc. ├── .dockerignore ├── .env.example # todas las variables, con valores de ejemplo (NUNCA un .env real) ├── README.md # explica el proyecto, cómo levantarlo y cada decisión de diseño ├── Dockerfile # imagen slim, deps pineadas, usuario NO-root, healthcheck ├── docs/ │ └── prompts/ │ └── fase-01.md # este mismo prompt, guardado como bitácora (ver sección Git) ├── src/ │ └── mcp_corp/ │ ├── init.py │ ├── main.py # entrypoint (python -m mcp_corp) │ ├── server.py # bootstrap del FastMCP server + registro de rutas + lifecycle │ ├── config.py # pydantic-settings: toda la config desde entorno │ ├── logging_setup.py # logging estructurado en JSON a stdout │ └── connectors/ │ └── init.py # vacío por ahora (placeholder para la Fase 2) ├── tests/ │ └── init.py └── deploy/ ├── swarm/ │ └── docker-compose.yml # servicio con deploy.replicas, healthcheck, labels de Traefik └── openshift/ └── .gitkeep # placeholder; los manifiestos K8s vienen en otra fase
-Requisitos NO NEGOCIABLES de cada pieza
+### Cómo levantarlo
 
-* config.py: usa pydantic-settings. Toda config (host, puerto, nivel de log, nombre del servicio, tamaño de pool por defecto, etc.) viene de variables de entorno con defaults sensatos. Nada hardcodeado. Refleja cada variable en .env.example.
-* logging_setup.py: logs estructurados en JSON a stdout. Deja preparado un mecanismo de "correlation id" por request (aunque aún no haya tools, la infraestructura de logging de auditoría debe existir desde ya). Nivel configurable por entorno.
-* server.py: crea el FastMCP server sobre Streamable HTTP. Expón DOS rutas HTTP separadas: `/health` (liveness: el proceso vive) y `/ready` (readiness: listo para recibir tráfico). Deben ser endpoints distintos, porque Swarm usa el healthcheck y OpenShift necesita liveness y readiness probes por separado. Implementa apagado graceful ante SIGTERM (cerrar limpio).
-* Dockerfile: base slim, dependencias pineadas, corre como usuario NO-root (requisito de seguridad para banca), incluye HEALTHCHECK apuntando a /health.
-* deploy/swarm/docker-compose.yml: define el servicio con `deploy: replicas: 2` (para demostrar escalado horizontal), healthcheck, y labels de Traefik para balancear entre réplicas. Comenta el archivo para que se entienda.
-* README.md: debe explicar qué es el proyecto, cómo levantarlo con uv en local, cómo correrlo en Docker, cómo probar /health y /ready, y una sección "Decisiones de diseño" que documente por qué stateless, por qué health+readiness separados, por qué usuario no-root, etc. Este README es parte del entregable, no un extra.
+```bash
+# Local con uv
+uv sync --extra dev
+cp .env.example .env
+uv run python -m mcp_corp
 
-Git
+# Docker
+docker build -t mcp-corp:fase1 .
+docker run --rm -p 8000:8000 --env-file .env mcp-corp:fase1
 
-* Configura la identidad de Git para este repo ANTES de cualquier commit: git config user.name "alvaradojuanm" git config user.email "<correo asociado a la cuenta de GitHub alvaradojuanm>" (Si no lo tienes definido, avísame y lo confirmo antes de que commitees. Puede ser el correo no-reply de GitHub del tipo ID+alvaradojuanm@users.noreply.github.com para no exponer el real.)
-* POLÍTICA DE AUTORÍA (OBLIGATORIA E INNEGOCIABLE): todos los commits deben aparecer ÚNICAMENTE bajo el usuario alvaradojuanm. NO añadas líneas "Co-authored-by:". NO añadas firmas de herramienta (nada de "Generated with...", "🤖", ni similares). NO te acredites como coautor de ninguna forma. El mensaje de commit debe contener SOLO la descripción del cambio, nada más.
-* Inicializa el repo con rama por defecto `main`.
-* Primer commit en `main`: solo el bootstrap mínimo (README, .gitignore, LICENSE si aplica).
-* Crea y cámbiate a la rama `feat/estructura-base` y construye ahí todo el andamiaje.
-* Añade el remoto: git@github.com:alvaradojuanm/mcp-corp.git
-* Guarda una copia EXACTA de este prompt en el repo como docs/prompts/fase-01.md, e inclúyelo en los commits de esta fase (es nuestra bitácora de trazabilidad; cada fase tendrá su archivo).
-* Haz commits atómicos y descriptivos. Empuja la rama `feat/estructura-base` al remoto.
-* NUNCA incluyas .env, credenciales ni secrets en ningún commit. Verifica el .gitignore antes de commitear.
+# Verificación
+curl -i http://localhost:8000/health   # liveness
+curl -i http://localhost:8000/ready    # readiness
+```
 
-Al terminar
+Escucha en `0.0.0.0:8000`. Endpoint MCP (Streamable HTTP) en `/mcp`.
 
-1. Verifica que el proyecto levanta con uv en local y que /health y /ready responden.
-2. Verifica que el contenedor construye y corre.
-3. Verifica que el server MCP es alcanzable con el MCP Inspector.
-4. Verifica con `git log` que los commits salen SOLO a nombre de alvaradojuanm, sin coautorías ni firmas de herramienta. Si aparece cualquier otra autoría, corrígelo antes de empujar.
-5. Dame un resumen de: qué versión exacta de fastmcp pineaste, qué archivos creaste, qué comandos usar para levantarlo, y cualquier decisión donde tuviste que elegir por mí.
-6. NO avances a tools ni conectores. Esta fase termina en el andamiaje.
+---
 
-Si algo es ambiguo o no puedes verificar contra la documentación actual, PREGUNTA antes de asumir. Prefiero corregir el rumbo ahora que rehacer después.
+## Verificaciones de aceptación
+
+- [x] `uv run` levanta el server en local
+- [x] `/health` responde 200 (liveness)
+- [x] `/ready` responde 200 (readiness); 503 durante arranque y apagado
+- [x] SIGTERM produce apagado graceful (`shutdown_initiated` → `Application shutdown complete`)
+- [x] Logging JSON estructurado a stdout, con `correlation_id` cableado vía `contextvars`
+- [x] Endpoint `/mcp` responde a un handshake `initialize` real
+- [x] **Contenedor construye** (validado con daemon real en máquina local)
+- [x] **Contenedor arranca y responde** — `Up (healthy)`, `HTTP/1.1 200 OK` en `/health`
+- [x] Corre como usuario no-root (`mcpcorp`, uid/gid 1000)
+- [x] `.gitignore` verificado: sin `.env` ni secretos en el historial
+- [x] `fastmcp` pineado a versión exacta
+- [x] Autoría verificada: solo `alvaradojuanm`, sin coautorías ni firmas de herramienta
+- [x] `main` empujada y establecida como rama por defecto
+- [x] Auditoría de dependencias sin hallazgos
+
+---
+
+## Hallazgos: dos bugs del contenedor detectados en la verificación
+
+El agente entregó el andamiaje de buena fe pero **no pudo verificar el contenedor** (su entorno tenía el CLI de Docker sin daemon). La validación en máquina local con Docker real destapó dos fallos. **Esta es la justificación del checklist de verificación.**
+
+### Bug 1 — `OSError: Readme file does not exist: README.md`
+
+- **Síntoma:** el build fallaba en `RUN uv sync --frozen --no-dev`.
+- **Causa:** `pyproject.toml` declara `readme = "README.md"` en su metadata; hatchling lo necesita al instalar el paquete, pero el Dockerfile nunca copiaba el README al contenedor.
+- **Fix:** añadir `README.md` al COPY existente → `COPY pyproject.toml uv.lock README.md ./`
+  (mejor que un COPY aparte: queda antes del primer `uv sync` y no rompe el cacheo de capas).
+
+### Bug 2 — `No module named mcp_corp` (el más grave)
+
+- **Síntoma:** la imagen **construía sin error** pero el contenedor moría al arrancar. Bug silencioso: build en verde, falla en despliegue.
+- **Causa:** `uv sync` instala en **modo editable** por defecto, dejando un `.pth` que apunta a `/app/src`. El runtime stage solo copia `/opt/venv`, no el código fuente — así que ese path no existe en la imagen final.
+- **Fix:** `RUN uv sync --frozen --no-dev --no-editable`
+  (superior a copiar `src/` al runtime: el paquete queda instalado de verdad dentro del venv y la imagen final no arrastra código fuente suelto).
+
+**Commits:** `44968cd` (README) y `fa00de9` (`--no-editable`), ambos en `main`.
+
+---
+
+## Auditoría de dependencias
+
+```bash
+uv export --no-hashes --format requirements-txt > requirements-audit.txt
+uvx pip-audit -r requirements-audit.txt
+```
+
+**Resultado: `No known vulnerabilities found`** — 77 dependencias de terceros auditadas (fastmcp, mcp, pydantic, uvicorn, httpx, cryptography, starlette, etc.).
+
+Un paquete omitido: `mcp-corp==0.1.0`, el propio proyecto — no está en PyPI, omisión esperada.
+
+> **Nota:** la auditoría es una foto del momento. Re-ejecutarla al cierre de cada fase, dado el ritmo de CVEs en este ecosistema. `requirements-audit.txt` es un artefacto derivado → va al `.gitignore`, no al repo (se regenera desde `uv.lock`, que sí está versionado).
+
+---
+
+## Decisiones tomadas por el agente
+
+| Decisión | Veredicto |
+|---|---|
+| `fastmcp==3.4.4` en vez de 3.4.3 (regresión en el guard de Host/Origin) | ✅ Aprobada — criterio de seguridad correcto |
+| `uvicorn==0.35.0` en vez de 0.34.0 | ✅ Forzada por resolución de dependencias, no fue elección |
+| Añadir `__main__.py` (fuera de la lista exacta) | ✅ Aprobada — obligatorio para `python -m mcp_corp` |
+| `uvicorn.Server` explícito en vez de `mcp.run()` | ✅ Aprobada — permite fijar `timeout_graceful_shutdown` desde config |
+| Sin `LICENSE` | ✅ Aprobada — pendiente de definir licencia |
+| Email `alvaradojuanm@gmail.com` | ❌ **Corregida** → noreply de GitHub |
+
+### Corrección de autoría
+
+El correo personal en el historial permanente de un repo corporativo no es aceptable. Se reescribió el historial completo con `git filter-repo` y force-push (`--force-with-lease`).
+
+- **Correo final:** `114210637+alvaradojuanm@users.noreply.github.com`
+- ID `114210637` verificado contra la API de GitHub.
+- Los 6 commits (incluido el bootstrap) muestran solo `alvaradojuanm` en author y committer.
+- Todos los hashes cambiaron por la reescritura — esperado.
+
+### Restricción del entorno del agente
+
+El harness solo permitía push a la rama designada, así que no pudo crear `main` ni `feat/estructura-base`. `main` se creó y empujó manualmente desde máquina local.
+
+**Decisión de ramas revisada:** se descartó `feat/estructura-base`. Con un equipo de una persona más el agente, el modelo es **trunk-based simple**: el agente empuja a su rama del harness, se revisa, y se integra a `main`. Sin ramas de feature ni PRs por ahora. Ruleset de protección de `main` **no activado** — sería fricción sin beneficio en esta etapa; se evaluará cuando el repo pase a producción o lo toquen más manos.
+
+---
+
+## Lecciones para las fases siguientes
+
+1. **Lo que el agente no puede verificar, se verifica en local.** Sus límites de entorno (sin daemon de Docker, sin Inspector) son puntos ciegos reales, no formalidades. Los dos bugs vivían exactamente ahí.
+2. **"El build pasa" ≠ "funciona".** El bug 2 pasó el build limpio. Validar siempre que el contenedor *arranque y responda*, no solo que compile.
+3. **Auditar dependencias en cada cierre de fase**, no solo al inicio.
+4. **La política de autoría hay que declararla explícitamente** en cada prompt — el agente por defecto usa el correo que encuentre disponible.
+
+---
+
+## Prompt entregado a Claude Code
+
+> El prompt íntegro está versionado en el repo como `docs/prompts/fase-01.md`. Resumen de sus secciones:
+
+- **Contexto y norte:** FastMCP 3.x sobre Streamable HTTP, stateless para escalar por réplicas (Swarm/Traefik hoy, OpenShift después), diseño 12-factor. Aviso explícito de que conectores, tools y gateway son fases posteriores.
+- **Instrucción de verificación previa:** consultar la documentación actual de FastMCP 3.x antes de escribir código (la 3.0 fue una reescritura mayor); preguntar en vez de inventar.
+- **Alcance exacto:** estructura de carpetas cerrada — `pyproject.toml`, `.gitignore`, `.dockerignore`, `.env.example`, `README.md`, `Dockerfile`, `docs/prompts/`, `src/mcp_corp/` (server, config, logging_setup, connectors vacío), `tests/`, `deploy/swarm/` y `deploy/openshift/`.
+- **Requisitos no negociables:** pydantic-settings sin nada hardcodeado; logging JSON con correlation id preparado; `/health` y `/ready` separados; graceful shutdown; contenedor no-root con HEALTHCHECK; compose con réplicas y labels de Traefik; README con sección de "Decisiones de diseño" como entregable.
+- **Git:** identidad configurada antes de commitear y **política de autoría obligatoria** (solo `alvaradojuanm`, sin `Co-authored-by:` ni firmas de herramienta); nunca `.env` ni secretos; guardar copia del prompt en `docs/prompts/`.
+- **Cierre:** verificar local, contenedor, Inspector y `git log`; reportar versión pineada, comandos de arranque y decisiones tomadas por cuenta propia; no avanzar a tools ni conectores.
+
+---
+
+## Siguiente
+
+**Fase 02 — Capa de conectores:** un módulo autocontenido por fuente, con límite de concurrencia, timeout y circuit breaker. Sobre el molde ya probado.

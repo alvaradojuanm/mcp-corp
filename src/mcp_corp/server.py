@@ -10,10 +10,13 @@ Decisiones clave (ver README para el detalle):
     Docker/Swarm y la liveness probe de OpenShift/Kubernetes.
   * `/ready` responde 200 solo cuando el server terminó su arranque y no
     está en proceso de apagado; lo usa la readiness probe de
-    OpenShift/Kubernetes para decidir si debe recibir tráfico nuevo. En esta
-    fase no hay conectores que verificar, así que readiness == "arrancado y
-    no apagándose"; en fases futuras se ampliará para chequear el estado de
-    los conectores (pools, circuit breakers).
+    OpenShift/Kubernetes para decidir si debe recibir tráfico nuevo.
+    `/ready` NUNCA se acopla a la salud de los conectores (Postgres, APIs,
+    etc.) — ver "Decisiones de diseño" en el README para el razonamiento
+    completo. En corto: si el breaker de una fuente se abre y eso tumbara
+    `/ready`, el balanceador sacaría la réplica ENTERA de rotación,
+    incluidas las tools que no dependen de esa fuente y sí funcionan. El
+    estado de los conectores se expone aparte, en `/diagnostics`.
 - No hay estado de negocio en el proceso: el único estado mutable aquí es la
   bandera de disponibilidad (`AppState.ready`), que es infraestructura de
   ciclo de vida, no estado de aplicación. Esto es compatible con el diseño
@@ -32,6 +35,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from mcp_corp.config import Settings
+from mcp_corp.connectors.registry import ConnectorRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -43,15 +47,20 @@ class AppState:
     ready: bool = False
 
 
-def create_server(settings: Settings) -> FastMCP:
+def create_server(settings: Settings, registry: ConnectorRegistry | None = None) -> FastMCP:
     """Construye el server FastMCP con lifecycle y rutas de salud registradas.
 
-    No registra ninguna tool: eso es alcance de fases futuras.
+    No registra ninguna tool: eso es alcance de fases futuras. `registry`
+    agrupa los conectores de datos (Postgres hoy); si se pasa, sus fuentes
+    se conectan al arrancar y se cierran al apagar, atado al mismo lifespan
+    que ya maneja `AppState.ready` — sin acoplar `/ready` a su salud.
     """
     state = AppState()
+    connector_registry = registry if registry is not None else ConnectorRegistry()
 
     @asynccontextmanager
     async def lifespan(_app: FastMCP) -> AsyncIterator[None]:
+        await connector_registry.connect_all()
         logger.info(
             "startup_complete",
             extra={"service": settings.service_name, "environment": settings.environment},
@@ -66,6 +75,7 @@ def create_server(settings: Settings) -> FastMCP:
             # de drenar sus conexiones en curso.
             state.ready = False
             logger.info("shutdown_initiated", extra={"service": settings.service_name})
+            await connector_registry.close_all()
 
     mcp: FastMCP = FastMCP(name=settings.service_name, lifespan=lifespan)
 
@@ -83,5 +93,12 @@ def create_server(settings: Settings) -> FastMCP:
             {"status": "not_ready", "service": settings.service_name},
             status_code=503,
         )
+
+    @mcp.custom_route("/diagnostics", methods=["GET"])
+    async def diagnostics(_request: Request) -> JSONResponse:
+        """Estado de cada conector (breaker, pool, última salud). No afecta
+        el balanceo: solo observabilidad manual/alertas, separado de
+        `/health` y `/ready` a propósito (ver docstring del módulo)."""
+        return JSONResponse({"connectors": await connector_registry.diagnostics()})
 
     return mcp

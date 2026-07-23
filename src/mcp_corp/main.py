@@ -18,6 +18,7 @@ import sys
 import uvicorn
 
 from mcp_corp.config import Settings, get_settings
+from mcp_corp.connectors.http import HTTP_INFRA_EXCEPTIONS, HttpConnector
 from mcp_corp.connectors.postgres import PostgresConnector
 from mcp_corp.connectors.registry import ConnectorRegistry
 from mcp_corp.connectors.resilience import ResilienceConfig, ResilientExecutor
@@ -49,6 +50,26 @@ def _build_connector_registry(settings: Settings) -> ConnectorRegistry:
             reset_timeout_seconds=pg_settings.circuit_reset_timeout_seconds,
             success_threshold=pg_settings.circuit_success_threshold,
             rate_limit_per_second=pg_settings.rate_limit_per_second,
+        )
+        registry.register(connector, ResilientExecutor(connector, resilience_config))
+
+    if settings.saldo_api.enabled:
+        api_settings = settings.saldo_api
+        connector = HttpConnector(
+            name="saldo_api",
+            base_url=api_settings.base_url,
+            request_timeout_seconds=api_settings.request_timeout_seconds,
+        )
+        resilience_config = ResilienceConfig(
+            source_name="saldo_api",
+            max_concurrency=api_settings.max_concurrency,
+            acquire_timeout_seconds=api_settings.acquire_timeout_seconds,
+            operation_timeout_seconds=api_settings.operation_timeout_seconds,
+            failure_threshold=api_settings.circuit_failure_threshold,
+            reset_timeout_seconds=api_settings.circuit_reset_timeout_seconds,
+            success_threshold=api_settings.circuit_success_threshold,
+            infra_exceptions=HTTP_INFRA_EXCEPTIONS,
+            rate_limit_per_second=api_settings.rate_limit_per_second,
         )
         registry.register(connector, ResilientExecutor(connector, resilience_config))
 

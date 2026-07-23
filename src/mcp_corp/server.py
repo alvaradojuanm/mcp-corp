@@ -36,6 +36,7 @@ from starlette.responses import JSONResponse
 
 from mcp_corp.config import Settings
 from mcp_corp.connectors.registry import ConnectorRegistry
+from mcp_corp.tools import register_prompts, register_resources, register_tools
 
 logger = logging.getLogger(__name__)
 
@@ -48,12 +49,18 @@ class AppState:
 
 
 def create_server(settings: Settings, registry: ConnectorRegistry | None = None) -> FastMCP:
-    """Construye el server FastMCP con lifecycle y rutas de salud registradas.
+    """Construye el server FastMCP: rutas de salud, tools, Resource y Prompt.
 
-    No registra ninguna tool: eso es alcance de fases futuras. `registry`
-    agrupa los conectores de datos (Postgres hoy); si se pasa, sus fuentes
-    se conectan al arrancar y se cierran al apagar, atado al mismo lifespan
-    que ya maneja `AppState.ready` — sin acoplar `/ready` a su salud.
+    `registry` agrupa los conectores de datos (Postgres, API de saldos);
+    si se pasa, sus fuentes se conectan al arrancar y se cierran al
+    apagar, atado al mismo lifespan que ya maneja `AppState.ready` — sin
+    acoplar `/ready` a su salud. Las tools de negocio (`tools.py`) solo se
+    registran si sus conectores están presentes en el registry.
+
+    `mask_error_details=True`: defensa en profundidad además del manejo
+    explícito de errores en `tools.py` — cualquier excepción que NO sea un
+    `ToolError` (es decir, un bug no contemplado) se enmascara con un
+    mensaje genérico hacia el cliente en vez de reenviar el traceback.
     """
     state = AppState()
     connector_registry = registry if registry is not None else ConnectorRegistry()
@@ -77,7 +84,11 @@ def create_server(settings: Settings, registry: ConnectorRegistry | None = None)
             logger.info("shutdown_initiated", extra={"service": settings.service_name})
             await connector_registry.close_all()
 
-    mcp: FastMCP = FastMCP(name=settings.service_name, lifespan=lifespan)
+    mcp: FastMCP = FastMCP(name=settings.service_name, lifespan=lifespan, mask_error_details=True)
+
+    register_tools(mcp, connector_registry)
+    register_resources(mcp)
+    register_prompts(mcp)
 
     @mcp.custom_route("/health", methods=["GET"])
     async def health(_request: Request) -> JSONResponse:

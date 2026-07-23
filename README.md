@@ -496,9 +496,45 @@ nombre de la tool, `duration_ms`, y `result` (`success` / `partial` /
 los parámetros de negocio: una cédula, nombre o saldo en claro en un log
 que viaja a un agregador externo es, en sí mismo, un problema de
 cumplimiento. Lo único que se conserva del identificador principal (la
-cédula) es un hash truncado (`sha256`, 12 hex) — permite correlacionar
-invocaciones del mismo cliente entre líneas de log sin poder recuperar el
-valor original a partir del log.
+cédula) es `HMAC-SHA256(clave, cédula)` truncado a 12 hex — permite
+correlacionar invocaciones del mismo cliente entre líneas de log sin poder
+recuperar el valor original a partir del log.
+
+**¿Por qué HMAC-SHA256 y no un `sha256(cédula)` plano?**
+Un hash plano NO es irreversible en este caso concreto: el espacio de
+cédulas (6 a 10 dígitos) es pequeño y enumerable — calcular `sha256` de
+los ~10 mil millones de valores posibles y armar una tabla arcoíris toma
+segundos en cualquier laptop. Cualquiera con acceso al log (el agregador
+externo, un auditor, un atacante que lo filtre) podría revertir el
+identificador sin necesitar ningún secreto — el "enmascaramiento" no
+protegería nada. `HMAC(clave, cédula)` corta ese ataque: sin conocer
+`audit_hmac_secret` (nueva variable en `.env.example`, nunca un valor real
+en el repo), ni siquiera se puede empezar a precomputar la tabla, porque
+el HMAC de cada cédula depende de una clave que no está en el log.
+Sigue siendo determinista (misma cédula + misma clave = mismo hash, ver
+`_mask` en `audit.py`) y por lo tanto correlacionable — pero deja de ser
+reversible por fuerza bruta desde fuera del server.
+
+**Qué pasa con la correlación histórica si `audit_hmac_secret` rota.**
+`HMAC(clave_nueva, cédula) ≠ HMAC(clave_vieja, cédula)` para la misma
+cédula — es el comportamiento esperado, no un defecto. Rotar la clave
+rompe la correlación entre logs de ANTES y DESPUÉS de la rotación para el
+mismo cliente: dos invocaciones de la misma cédula, una a cada lado de la
+rotación, quedan con hashes distintos y no se pueden enlazar mirando solo
+el log. Es exactamente el trade-off deseable al rotar por sospecha de
+compromiso de la clave: invalida la posibilidad de correlacionar hacia
+atrás usando la clave filtrada. Si en el futuro se necesita continuidad de
+correlación durante una rotación planificada (no por incidente), la única
+forma es calcular el hash con AMBAS claves durante una ventana de
+transición — no implementado en esta fase.
+
+**Clave igual en todas las réplicas, no por-réplica.**
+A diferencia del estado del circuit breaker (que sí es por réplica, ver
+Fase 2), `audit_hmac_secret` debe ser IDÉNTICA en todas las réplicas: si
+cada una tuviera su propia clave, la misma cédula produciría hashes
+distintos según qué réplica atendió la invocación, y dejarías de poder
+correlacionar al mismo cliente entre logs de réplicas diferentes — el
+caso de uso exactamente contrario al del breaker.
 
 **Hallazgo importante: el `JSONFormatter` de la Fase 1 ignoraba `extra={}`.**
 Al validar el log de auditoría de punta a punta se descubrió que

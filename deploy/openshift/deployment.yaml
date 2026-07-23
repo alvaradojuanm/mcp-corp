@@ -1,0 +1,81 @@
+# Deployment de mcp-corp. Mismo proceso/imagen que Docker Swarm — lo único
+# que cambia es la capa de orquestación (ver README de esta carpeta).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-corp
+  labels:
+    app: mcp-corp
+spec:
+  # Escalado horizontal: el proceso es stateless por invocación, así que
+  # cualquier réplica puede atender cualquier request sin sticky sessions
+  # (misma razón que en deploy/swarm/docker-compose.yml). Ajusta junto con
+  # el max_concurrency de cada conector en configmap.yaml — ver la fórmula
+  # de capacidad en el README raíz.
+  replicas: 3
+  selector:
+    matchLabels:
+      app: mcp-corp
+  strategy:
+    # Equivalente al `update_config.order: start-first` de Swarm: las
+    # réplicas nuevas arrancan y pasan su readinessProbe ANTES de que se
+    # retiren las viejas, así nunca hay una ventana sin capacidad.
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: mcp-corp
+    spec:
+      # Le da tiempo al proceso a drenar conexiones en curso antes de que
+      # Kubernetes lo mate con SIGKILL. Debe ser mayor que
+      # MCP_CORP_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS (10s) para dejarle
+      # margen real a uvicorn, no solo el mínimo exacto.
+      terminationGracePeriodSeconds: 20
+      containers:
+        - name: mcp-corp
+          image: mcp-corp:latest
+          ports:
+            - containerPort: 8000
+              name: http
+          envFrom:
+            - configMapRef:
+                name: mcp-corp-config
+            - secretRef:
+                name: mcp-corp-secrets
+          # Liveness y readiness SEPARADAS — ver el porqué en el README de
+          # esta carpeta (es la razón de ser de haberlas separado desde la
+          # Fase 1). `/ready` NUNCA depende de la salud de los conectores
+          # (Postgres, APIs): eso vive aparte, en `/diagnostics`, que no
+          # se sondea desde ninguna probe.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8000
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+          securityContext:
+            # Coherente con el Dockerfile (usuario no-root, uid/gid 1000).
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false

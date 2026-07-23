@@ -1,0 +1,16 @@
+# Service ClusterIP: agrupa las réplicas del Deployment y las balancea
+# dentro del cluster. Equivalente al loadbalancer de Traefik en Swarm.
+apiVersion: v1
+kind: Service
+metadata:
+  name: mcp-corp
+  labels:
+    app: mcp-corp
+spec:
+  type: ClusterIP
+  selector:
+    app: mcp-corp
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http

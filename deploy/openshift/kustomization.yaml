@@ -1,0 +1,13 @@
+# Amarra los manifiestos de esta carpeta. `secret.example.yaml` NO se
+# incluye a propósito: es una plantilla de referencia, no algo para
+# aplicar tal cual (ver README de esta carpeta para cómo crear el Secret
+# real). Con `kubectl apply -k` / `oc apply -k` sobre este directorio se
+# aplican configmap, deployment, service y route.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - configmap.yaml
+  - deployment.yaml
+  - service.yaml
+  - route.yaml

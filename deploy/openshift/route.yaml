@@ -1,0 +1,18 @@
+# Route de OpenShift (equivalente a un Ingress en Kubernetes vanilla).
+# Ajusta el host antes de aplicar en un cluster real.
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: mcp-corp
+  labels:
+    app: mcp-corp
+spec:
+  host: mcp-corp.apps.example-cluster.local
+  to:
+    kind: Service
+    name: mcp-corp
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect

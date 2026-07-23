@@ -1,0 +1,25 @@
+# Variables de entorno NO sensibles. Lo sensible (DSN de Postgres, HMAC
+# de auditoría) va en secret.example.yaml, nunca aquí.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mcp-corp-config
+  labels:
+    app: mcp-corp
+data:
+  MCP_CORP_SERVICE_NAME: "mcp-corp"
+  MCP_CORP_ENVIRONMENT: "production"
+  MCP_CORP_HOST: "0.0.0.0"
+  MCP_CORP_PORT: "8000"
+  MCP_CORP_LOG_LEVEL: "INFO"
+  MCP_CORP_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS: "10"
+
+  # Conectores: habilitados de ejemplo. Ajusta max_concurrency según la
+  # fórmula de capacidad (techo de la fuente ÷ nº de réplicas, ver
+  # deployment.yaml y el README) cada vez que cambies `spec.replicas`.
+  MCP_CORP_POSTGRES__ENABLED: "true"
+  MCP_CORP_POSTGRES__MAX_POOL_SIZE: "10"
+  MCP_CORP_POSTGRES__MAX_CONCURRENCY: "10"
+  MCP_CORP_SALDO_API__ENABLED: "true"
+  MCP_CORP_SALDO_API__BASE_URL: "http://saldo-api.mcp-corp.svc.cluster.local:8080"
+  MCP_CORP_SALDO_API__MAX_CONCURRENCY: "10"

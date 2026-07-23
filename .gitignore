@@ -25,6 +25,9 @@ pip-wheel-metadata/
 .uv/
 uv.lock.bak
 
+# Auditoría de dependencias (artefacto derivado, se regenera bajo demanda)
+requirements-audit.txt
+
 # Testing / coverage
 .pytest_cache/
 .coverage

@@ -176,6 +176,22 @@ class Settings(BaseSettings):
     postgres: PostgresSettings = Field(default_factory=PostgresSettings)
     saldo_api: SaldoApiSettings = Field(default_factory=SaldoApiSettings)
 
+    # Auditoría (ver audit.py): clave del HMAC-SHA256 usado para
+    # enmascarar identificadores de negocio (p. ej. cédulas) en el log.
+    # DEBE ser igual en todas las réplicas — si cada una tuviera una
+    # clave distinta, la misma cédula produciría hashes distintos según
+    # qué réplica atendió la invocación, rompiendo la correlación entre
+    # logs de réplicas diferentes. Genera un valor con:
+    # `python -c "import secrets; print(secrets.token_hex(32))"`
+    audit_hmac_secret: str = Field(
+        default="",
+        description=(
+            "Clave secreta para el HMAC-SHA256 del log de auditoría. Vacío en el default de "
+            "desarrollo (el enmascaramiento sigue funcionando, pero con clave débil); en "
+            "producción debe ser un secreto largo y aleatorio, igual en todas las réplicas."
+        ),
+    )
+
     # Apagado
     graceful_shutdown_timeout_seconds: float = Field(
         default=10.0,

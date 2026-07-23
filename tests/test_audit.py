@@ -1,16 +1,20 @@
-"""Unitarios de `audit.audited_tool`: enmascaramiento y forma del log."""
+"""Unitarios de `audit.audited_tool`: enmascaramiento HMAC y forma del log."""
 
 from __future__ import annotations
 
+import hashlib
 import logging
 
 import pytest
 
-from mcp_corp.audit import audited_tool
+from mcp_corp.audit import _mask, audited_tool
+
+SECRET_A = b"clave-secreta-de-prueba-a"
+SECRET_B = b"clave-secreta-de-prueba-b"
 
 
 async def test_masks_identifier_and_never_logs_raw_value(caplog: pytest.LogCaptureFixture) -> None:
-    @audited_tool("mi_tool", identifier_param="cedula")
+    @audited_tool("mi_tool", identifier_param="cedula", secret=SECRET_A)
     async def mi_tool(cedula: str) -> dict:
         return {"ok": True}
 
@@ -23,13 +27,13 @@ async def test_masks_identifier_and_never_logs_raw_value(caplog: pytest.LogCaptu
     completed = next(r for r in caplog.records if r.message == "tool_invocation_completed")
 
     assert started.tool == "mi_tool"
-    assert started.identifier.startswith("sha256:")
+    assert started.identifier.startswith("hmac-sha256:")
     assert completed.result == "success"
     assert completed.duration_ms >= 0
 
 
-async def test_same_identifier_value_masks_to_the_same_hash(caplog: pytest.LogCaptureFixture) -> None:
-    @audited_tool("mi_tool", identifier_param="cedula")
+async def test_same_identifier_and_key_masks_to_the_same_hash(caplog: pytest.LogCaptureFixture) -> None:
+    @audited_tool("mi_tool", identifier_param="cedula", secret=SECRET_A)
     async def mi_tool(cedula: str) -> dict:
         return {}
 
@@ -41,8 +45,31 @@ async def test_same_identifier_value_masks_to_the_same_hash(caplog: pytest.LogCa
     started = [r for r in caplog.records if r.message == "tool_invocation_started"]
     identifiers = [r.identifier for r in started]
 
-    assert identifiers[0] == identifiers[1]  # misma cédula -> mismo hash, correlacionable
+    assert identifiers[0] == identifiers[1]  # misma cédula, misma clave -> mismo hash, correlacionable
     assert identifiers[0] != identifiers[2]  # cédula distinta -> hash distinto
+
+
+def test_mask_is_hmac_not_plain_hash_and_depends_on_the_key() -> None:
+    cedula = "1000000001"
+
+    masked_a = _mask(cedula, SECRET_A)
+    masked_b = _mask(cedula, SECRET_B)
+    plain_sha256 = f"hmac-sha256:{hashlib.sha256(cedula.encode()).hexdigest()[:12]}"
+
+    # Sin la clave correcta, el valor no reproduce el hash (a diferencia de
+    # un sha256 plano, que cualquiera puede recomputar por fuerza bruta
+    # sobre el espacio pequeño y enumerable de cédulas).
+    assert masked_a != masked_b
+    assert masked_a != plain_sha256
+
+
+def test_mask_changes_when_secret_rotates() -> None:
+    """Rotar la clave rompe la correlación histórica: es el comportamiento esperado."""
+    cedula = "1000000001"
+    before_rotation = _mask(cedula, SECRET_A)
+    after_rotation = _mask(cedula, SECRET_B)
+
+    assert before_rotation != after_rotation
 
 
 async def test_reports_failure_with_reason_and_reraises(caplog: pytest.LogCaptureFixture) -> None:

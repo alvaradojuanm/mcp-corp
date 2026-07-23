@@ -153,13 +153,16 @@ async def _resumen_cliente_logic(
 # --- Registro sobre el server FastMCP -----------------------------------
 
 
-def register_tools(mcp: FastMCP, registry: ConnectorRegistry) -> None:
+def register_tools(mcp: FastMCP, registry: ConnectorRegistry, audit_hmac_secret: bytes) -> None:
     """Registra las tres tools de negocio, si sus conectores existen.
 
     Si Postgres o la API de saldos no están habilitados en esta réplica
     (`settings.postgres.enabled` / `settings.saldo_api.enabled`), no
     registra tools en vez de fallar: un server sin ambas fuentes no puede
     ofrecer estas tools con sentido.
+
+    `audit_hmac_secret`: clave del HMAC usado por `audit.audited_tool` para
+    enmascarar la cédula en el log (ver `Settings.audit_hmac_secret`).
     """
     if "postgres" not in registry or "saldo_api" not in registry:
         logger.warning(
@@ -175,7 +178,7 @@ def register_tools(mcp: FastMCP, registry: ConnectorRegistry) -> None:
     saldo_executor = registry.get("saldo_api").executor
 
     @mcp.tool
-    @audited_tool("consultar_cliente", identifier_param="cedula")
+    @audited_tool("consultar_cliente", identifier_param="cedula", secret=audit_hmac_secret)
     async def consultar_cliente(cedula: Cedula) -> dict[str, Any]:
         """Consulta los datos de identidad de un cliente por cédula (fuente: PostgreSQL).
 
@@ -186,7 +189,7 @@ def register_tools(mcp: FastMCP, registry: ConnectorRegistry) -> None:
         return await _consultar_cliente_logic(cedula, postgres_executor)
 
     @mcp.tool
-    @audited_tool("consultar_saldo", identifier_param="cedula")
+    @audited_tool("consultar_saldo", identifier_param="cedula", secret=audit_hmac_secret)
     async def consultar_saldo(cedula: Cedula) -> dict[str, Any]:
         """Consulta el saldo actual de un cliente por cédula (fuente: API REST de saldos).
 
@@ -199,6 +202,7 @@ def register_tools(mcp: FastMCP, registry: ConnectorRegistry) -> None:
     @audited_tool(
         "resumen_cliente",
         identifier_param="cedula",
+        secret=audit_hmac_secret,
         outcome_of=lambda result: "success" if result["resumen_completo"] else "partial",
     )
     async def resumen_cliente(cedula: Cedula) -> dict[str, Any]:

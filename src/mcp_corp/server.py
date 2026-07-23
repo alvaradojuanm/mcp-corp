@@ -86,7 +86,12 @@ def create_server(settings: Settings, registry: ConnectorRegistry | None = None)
 
     mcp: FastMCP = FastMCP(name=settings.service_name, lifespan=lifespan, mask_error_details=True)
 
-    register_tools(mcp, connector_registry)
+    if not settings.audit_hmac_secret:
+        logger.warning(
+            "audit_hmac_secret_not_configured",
+            extra={"detail": "MCP_CORP_AUDIT_HMAC_SECRET vacío: enmascarado con clave débil, no usar así en producción"},
+        )
+    register_tools(mcp, connector_registry, settings.audit_hmac_secret.encode("utf-8"))
     register_resources(mcp)
     register_prompts(mcp)
 

@@ -208,3 +208,141 @@ warning actual está bien.
 
 Si algo es ambiguo o no puedes verificar contra fuentes, PREGUNTA antes de asumir. Prefiero corregir
 el rumbo ahora que rehacer después.
+# Fase 04 — Identificadores venezolanos + despliegue y escalado
+
+| Campo | Valor |
+|---|---|
+| **Fase** | 04 |
+| **Objetivo** | Parte A: normalización/validación de cédula y RIF. Parte B: escalado horizontal verificado con números reales. |
+| **Repo** | `github.com/alvaradojuanm/mcp-corp` |
+| **Commits** | 15 (Parte A y Parte B separados) |
+| **Estado** | ✅ **CERRADA** |
+| **Fecha de cierre** | 23 de julio de 2026 |
+| **Tests** | 93/93 en el repo completo |
+
+---
+
+# PARTE A — Identificadores venezolanos
+
+## Resultado
+
+Módulo `src/mcp_corp/identifiers.py` que acepta cédula y RIF en cualquier forma usual —con o sin puntos de millar, guiones, letra, mayúscula o minúscula— y normaliza a una estructura canónica `IdentidadFiscal(prefijo, numero, digito_verificador)`.
+
+Ejemplos equivalentes soportados: `16760320`, `V-16.760.320`, `V16760320`, `J-16760320-0`, `J16.760.320-0`.
+
+**La normalización vive en el código, no en el modelo.** El esquema que ve el LLM acepta formato flexible; el server limpia. El modelo no tiene que adivinar ni sanear la entrada del usuario.
+
+## El dígito verificador — activado, con reserva
+
+**Metodología del agente:** cruzó tres implementaciones independientes (gist python-venezuela, `joseayram/utils` en PHP, `django-localflavor-ve`) que coincidieron exactamente, y lo confirmó contra un ejemplo real citado como válido en fuente externa (`V-13222105-3`: suma=63, residuo=8, verificador=3). Con esa coincidencia lo activó por defecto (`validar_digito_verificador=True`), desactivable por config.
+
+### ⚠️ Reserva sobre la evidencia
+
+**Tres implementaciones que coinciden no son tres fuentes independientes.** Pueden descender todas del mismo origen, y ninguna es del SENIAT. Sumado a un único ejemplo real verificado, es evidencia razonable para activarlo — **pero no es prueba**.
+
+Descartado para esta fase: no se validará contra un lote de RIFs reales de producción. Queda como riesgo residual conocido y documentado, no como pendiente activo.
+
+## Prefijos
+
+**Válidos y activos:** `V` (natural venezolana), `E` (natural extranjera), `J` (jurídica), `G` (gubernamental), `P` (pasaporte).
+
+**`C`** (comunas, consejos comunales, organizaciones del Poder Popular): existe desde 2015 pero las fuentes difieren sobre su vigencia actual, y su fórmula de checksum solo está documentada por una fuente. → **Deshabilitado por defecto, activable por config.** Decisión correcta ante ambigüedad.
+
+### Trampa evitada: la letra `I`
+
+`I` **no existe** en el registro del SENIAT — el prefijo correcto para extranjeros es `E`. Muchas librerías y regex publicados heredaron ese error de fuentes no oficiales. Hay **test de regresión explícito** que la rechaza.
+
+## Tests Parte A
+
+41/41 en `test_identifiers.py`: tabla de formatos equivalentes, prefijos válidos, rechazo de `I`, distinción cédula/RIF, relleno con cero, casos de checksum. Se actualizaron el seed de Postgres, el stub de saldos y los tests de la Fase 3 al formato venezolano real.
+
+---
+
+# PARTE B — Despliegue y escalado
+
+## Números reales medidos
+
+Con réplicas y stack reales, no simulados.
+
+| Verificación | Resultado |
+|---|---|
+| **Fórmula de capacidad** | 3 réplicas × pool de 3 → conexiones a Postgres estables en **9, nunca más**. Confirmado con `pg_stat_activity` bajo carga sostenida. **La fórmula se cumple.** |
+| **Umbral de PgBouncer** | Con `max_connections=100`: ~19 réplicas con pool de 5, o ~9 réplicas con pool de 10 *(ver ajuste abajo)* |
+| **Saturación del semáforo** | Timeout generoso → 50/50 esperaron y se sirvieron (p95 2.03 s). Timeout agresivo → 13/60 rechazados limpio, circuito siguió `closed`. **No encola infinito.** |
+| **`/ready` bajo carga** | 45/45 en `200`, incluso saturado y con `saldo_api` caído. **Confirma la decisión de la Fase 2 de desacoplarlo de las fuentes.** |
+| **Breaker por réplica** | Confirmado con `/diagnostics` simultáneo: réplica A `open`, réplica B `closed` |
+| **Graceful shutdown bajo carga** | **470/470** tool-calls completadas antes de apagar |
+
+### ⚠️ Ajuste al umbral de PgBouncer
+
+El cálculo asume las 100 conexiones disponibles, pero Postgres reserva algunas para superusuario (`superuser_reserved_connections`, por defecto 3) y esa instancia puede tener otros consumidores.
+
+**Trabajar con ~85 conexiones útiles, no 100.** Recalcular los umbrales sobre esa base.
+
+---
+
+## Hallazgo 1: el stream SSE se corta ante SIGTERM
+
+**No estaba anticipado y es el hallazgo más valioso de la fase.**
+
+Al recibir SIGTERM, el stream SSE de la sesión se corta sin esperar el timeout completo. Ninguna tool-call queda a medias —eso funciona bien— pero **la sesión se pierde**.
+
+**Implicación práctica:** en cada rolling update, los clientes MCP conectados pierden su sesión y deben reconectar.
+
+**Consecuencias a atender:**
+1. Los clientes que consuman este server **necesitan lógica de reconexión**. No es opcional; es parte del contrato.
+2. Es exactamente el tipo de cosa que **un gateway podría enmascarar** — manteniendo la sesión del lado del cliente mientras rota las réplicas por detrás. → **Anotado como requisito para la Fase 5.**
+
+## Hallazgo 2: el breaker por réplica no es "descubrimiento independiente"
+
+El agente observó réplica A en `open` y réplica B en `closed`, pero **B estaba `closed` porque nunca recibió tráfico hacia esa fuente**, no porque hubiera evaluado y decidido.
+
+**La implicación real, que el reporte no sacó:** el mismo request se comporta distinto según qué réplica lo atienda. Si cae en A, falla rápido (circuito abierto). Si cae en B, intenta y quizás expira. **El usuario percibe comportamiento no determinista ante la misma fuente caída.**
+
+Es aceptable y coherente con la decisión de la Fase 2, pero hay que documentarlo. Y es el argumento concreto a favor de **estado de breaker compartido vía Redis** si algún día la inconsistencia molesta.
+
+---
+
+## Fail-closed del HMAC — resuelto
+
+Pendiente heredado de la Fase 3, ya cerrado: `Settings` valida al construirse. Con `environment=production` y sin `audit_hmac_secret`, lanza `ValidationError` y **el proceso no arranca**. En desarrollo se mantiene el warning.
+
+## Artefactos de despliegue
+
+- `deploy/swarm/docker-compose.yml` revisado para que `deploy.replicas` funcione con las labels de Traefik balanceando.
+- `deploy/openshift/` con manifiestos: Deployment con `replicas`, Service, y sondas de **liveness → `/health`** y **readiness → `/ready`**. Esta es la razón por la que se separaron desde la Fase 1.
+- Script de prueba de carga reproducible.
+
+## Lo que no se pudo verificar
+
+- **Un Swarm o cluster real** (solo Docker Desktop de un nodo). Pendiente de validar en Portainer.
+- **SIGTERM nativo en Windows** (`taskkill` sin `/F` lo rechaza explícitamente). Se probó el shutdown dentro de un contenedor Docker — Linux real, mismo mecanismo que usarían Swarm y Kubernetes. Verificación válida.
+
+## pip-audit
+
+82 paquetes, sin vulnerabilidades. No se agregaron dependencias nuevas en ninguna de las dos partes.
+
+---
+
+## Pendientes
+
+- [ ] Recalcular umbrales de PgBouncer sobre ~85 conexiones útiles
+- [ ] Verificar escalado en un Swarm real (Portainer)
+- [ ] Documentar el requisito de reconexión para clientes MCP
+- [ ] Evaluar si el fix de Windows (`WindowsSelectorEventLoopPolicy`) debe salir de `main.py` *(heredado Fase 2)*
+- [ ] Probar contra la instancia de Postgres 18 en `localhost:5433` *(heredado Fase 2)*
+
+---
+
+## Lecciones
+
+1. **Coincidencia entre implementaciones de terceros no es verificación.** Pueden compartir un origen común. La prueba real es contra datos de producción.
+2. **"Ambas réplicas coinciden" puede significar "una nunca lo intentó".** Cuidado al leer resultados de estado distribuido: la ausencia de desacuerdo no es acuerdo.
+3. **Ejercitar bajo carga real destapa lo que ninguna revisión de código encuentra.** El corte del SSE ante SIGTERM no aparece en ningún test unitario — solo con tráfico y una señal de apagado de verdad.
+4. **Los cálculos de capacidad necesitan margen.** El techo nominal nunca es el techo real: siempre hay reservas y otros consumidores.
+
+---
+
+## Siguiente
+
+**Fase 05 — Gobierno:** el gateway con identidad por área, RBAC a nivel de tool, auditoría centralizada y control de costos. Requisito adicional surgido de esta fase: **evaluar si el gateway puede enmascarar la pérdida de sesión SSE durante rotaciones de réplicas.**

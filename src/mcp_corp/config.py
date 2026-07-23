@@ -7,7 +7,7 @@ se puede sobreescribir vía variables de entorno (o un `.env` en desarrollo).
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -228,6 +228,25 @@ class Settings(BaseSettings):
         default=10.0,
         description="Segundos de gracia para drenar conexiones en curso al recibir SIGTERM.",
     )
+
+    @model_validator(mode="after")
+    def _fail_closed_en_produccion_sin_clave_hmac(self) -> "Settings":
+        """Fail-closed (Fase 4, Parte B): en producción, sin clave el proceso NO arranca.
+
+        En cualquier otro entorno (`local`, `staging`), una clave vacía solo
+        registra un warning al construir el server (ver `server.py`) — el
+        enmascaramiento sigue siendo determinista pero con clave débil, algo
+        aceptable para desarrollo y no para el entorno que sí produce logs
+        que se auditan de verdad. `environment` se decide por variable de
+        entorno (`MCP_CORP_ENVIRONMENT`), igual que el resto de la config.
+        """
+        if self.environment == "production" and not self.audit_hmac_secret:
+            raise ValueError(
+                "MCP_CORP_AUDIT_HMAC_SECRET es obligatorio cuando MCP_CORP_ENVIRONMENT=production. "
+                "Un HMAC con clave vacía es determinista y públicamente reproducible: el "
+                "enmascaramiento de auditoría no protegería nada. El proceso no arranca así."
+            )
+        return self
 
 
 def get_settings() -> Settings:

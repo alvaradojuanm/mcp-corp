@@ -36,6 +36,7 @@ from starlette.responses import JSONResponse
 
 from mcp_corp.config import Settings
 from mcp_corp.connectors.registry import ConnectorRegistry
+from mcp_corp.identifiers import prefijos_habilitados
 from mcp_corp.tools import register_prompts, register_resources, register_tools
 
 logger = logging.getLogger(__name__)
@@ -91,7 +92,13 @@ def create_server(settings: Settings, registry: ConnectorRegistry | None = None)
             "audit_hmac_secret_not_configured",
             extra={"detail": "MCP_CORP_AUDIT_HMAC_SECRET vacío: enmascarado con clave débil, no usar así en producción"},
         )
-    register_tools(mcp, connector_registry, settings.audit_hmac_secret.encode("utf-8"))
+    register_tools(
+        mcp,
+        connector_registry,
+        settings.audit_hmac_secret.encode("utf-8"),
+        identifiers_prefijos=prefijos_habilitados(incluir_c=settings.identifiers.incluir_prefijo_c),
+        identifiers_validar_checksum=settings.identifiers.validar_digito_verificador,
+    )
     register_resources(mcp)
     register_prompts(mcp)
 

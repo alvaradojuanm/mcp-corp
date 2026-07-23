@@ -11,6 +11,34 @@ from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+class IdentifiersSettings(BaseModel):
+    """Config de la normalización/validación de identificadores (Fase 4).
+
+    Ver `identifiers.py` para el módulo completo y el README para el
+    detalle de cómo se verificó el algoritmo del dígito verificador.
+    """
+
+    incluir_prefijo_c: bool = Field(
+        default=False,
+        description=(
+            "Habilita el prefijo 'C' (comunas/consejos comunales/organizaciones del Poder "
+            "Popular). Existe desde un anuncio oficial de 2015, pero las fuentes consultadas "
+            "difieren sobre si sigue vigente en el set actual del SENIAT — por eso queda "
+            "detrás de este flag en vez de cableado por defecto."
+        ),
+    )
+    validar_digito_verificador: bool = Field(
+        default=True,
+        description=(
+            "Si True, cuando el identificador trae dígito verificador (RIF completo) se "
+            "valida el checksum módulo 11 antes de tocar cualquier conector. Algoritmo "
+            "verificado cruzando 3 implementaciones independientes y un ejemplo real conocido "
+            "(V-13222105-3); ver README. Si el verificador falta (cédula sin RIF completo), "
+            "NO se rechaza — es el caso normal."
+        ),
+    )
+
+
 class PostgresSettings(BaseModel):
     """Config de la fuente Postgres: conexión + resiliencia propia.
 
@@ -175,6 +203,9 @@ class Settings(BaseSettings):
     # concurrencia, timeout y breaker — nunca comparten presupuesto.
     postgres: PostgresSettings = Field(default_factory=PostgresSettings)
     saldo_api: SaldoApiSettings = Field(default_factory=SaldoApiSettings)
+
+    # Normalización/validación de identificadores venezolanos (Fase 4).
+    identifiers: IdentifiersSettings = Field(default_factory=IdentifiersSettings)
 
     # Auditoría (ver audit.py): clave del HMAC-SHA256 usado para
     # enmascarar identificadores de negocio (p. ej. cédulas) en el log.

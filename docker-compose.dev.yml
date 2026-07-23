@@ -1,11 +1,12 @@
-# Postgres de desarrollo para probar el conector de la Fase 2 contra una
-# base real. NO es el stack de despliegue (eso es deploy/swarm/); esto es
-# solo para levantar localmente lo que necesita el test de integración de
-# `tests/connectors/test_postgres_integration.py`.
+# Infraestructura de desarrollo para probar los conectores reales de las
+# Fases 2 y 3 (Postgres + el stub de la API de saldos). NO es el stack de
+# despliegue (eso es deploy/swarm/); esto es solo para levantar localmente
+# lo que necesitan los tests de integración en tests/connectors/ y
+# tests/tools/.
 #
 # Uso:
 #   docker compose -f docker-compose.dev.yml up -d
-#   uv run pytest tests/connectors/test_postgres_integration.py
+#   uv run pytest
 #   docker compose -f docker-compose.dev.yml down -v
 
 services:
@@ -21,6 +22,20 @@ services:
       - ./deploy/dev/postgres-seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U mcp_corp -d mcp_corp"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+
+  saldo-api:
+    image: python:3.12-alpine
+    working_dir: /app
+    volumes:
+      - ./deploy/dev/saldo_api_stub.py:/app/saldo_api_stub.py:ro
+    command: ["python", "saldo_api_stub.py"]
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health', timeout=2)"]
       interval: 2s
       timeout: 3s
       retries: 10

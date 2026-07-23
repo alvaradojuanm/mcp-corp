@@ -5,12 +5,14 @@ repositorio es la **plantilla base** que se clonará para cada fuente de datos
 concreta; por eso esta fase prioriza claridad y solidez del andamiaje sobre
 velocidad de entrega.
 
-**Estado actual: Fase 4 (Parte A) — identificadores venezolanos.** Fases 1
-(andamiaje base), 2 (capa de conectores + Postgres) y 3 (conector HTTP +
-tools MCP + auditoría) cerradas. Esta parte suma normalización y
-validación de cédulas/RIF venezolanos (`identifiers.py`), para que las
-tools acepten el formato que de verdad escribe un usuario, no solo dígitos
-limpios. La Parte B (despliegue y escalado horizontal) sigue en curso.
+**Estado actual: Fase 4 — identificadores venezolanos + despliegue y escalado.**
+Fases 1 (andamiaje base), 2 (capa de conectores + Postgres) y 3 (conector
+HTTP + tools MCP + auditoría) cerradas. La Fase 4 tuvo dos partes: la
+Parte A normaliza y valida cédulas/RIF venezolanos (`identifiers.py`) para
+que las tools acepten el formato que de verdad escribe un usuario; la
+Parte B verifica bajo carga real la tesis central del diseño — más
+réplicas atienden más tráfico sin tocar el código — y deja el fail-closed
+del HMAC de auditoría en modo producción.
 
 ## Qué es esto
 
@@ -263,11 +265,191 @@ está levantado).
 ## Cómo desplegarlo en Docker Swarm
 
 ```bash
+# Obligatorio: MCP_CORP_ENVIRONMENT=production (ya fijado en el compose)
+# exige MCP_CORP_AUDIT_HMAC_SECRET, fail-closed desde la Fase 4 — ver
+# "Modo producción y fail-closed del HMAC" más abajo.
+export MCP_CORP_AUDIT_HMAC_SECRET="$(python -c 'import secrets; print(secrets.token_hex(32))')"
 docker stack deploy -c deploy/swarm/docker-compose.yml mcp-corp
 ```
 
 Ver los comentarios en [`deploy/swarm/docker-compose.yml`](deploy/swarm/docker-compose.yml)
-para el detalle de las labels de Traefik y el healthcheck.
+para el detalle de las labels de Traefik, el healthcheck, y cómo escalar
+réplicas desde Portainer.
+
+## Cómo desplegarlo en OpenShift / Kubernetes
+
+Esqueleto de manifiestos en [`deploy/openshift/`](deploy/openshift/) —
+Deployment con sondas de liveness (`/health`) y readiness (`/ready`)
+separadas, Service, Route y ConfigMap/Secret. **No se probó contra un
+cluster real** (no había uno disponible en este entorno); ver el
+[README de esa carpeta](deploy/openshift/README.md) para qué cambia
+al migrar desde Swarm (solo la capa de orquestación) y qué no (el
+código del server).
+
+## Prueba de carga y verificaciones de escalado horizontal (Fase 4, Parte B)
+
+[`deploy/dev/load_test.py`](deploy/dev/load_test.py) es un script simple
+(sin `hey` ni `locust`, solo `fastmcp.Client`) que abre N sesiones MCP
+concurrentes y mide throughput/latencias:
+
+```bash
+uv run python deploy/dev/load_test.py \
+  --url http://localhost:8000/mcp \
+  --tool resumen_cliente \
+  --identificador V16760320 \
+  --concurrency 20 \
+  --requests-per-worker 20
+```
+
+### Lo que se verificó bajo carga real (no teoría) y los números medidos
+
+Todo lo de abajo se corrió contra Postgres y el stub de saldos reales de
+`docker-compose.dev.yml`, con réplicas reales del server (procesos/
+contenedores independientes, no simulados) generando y sirviendo tráfico
+concurrente real.
+
+**1. Fórmula de capacidad (`límite por réplica = techo de la fuente ÷ nº de réplicas`).**
+Se levantaron 3 réplicas reales, cada una con `MAX_POOL_SIZE=3` y
+`MAX_CONCURRENCY=3` para Postgres, y se les generó carga concurrente
+simultánea a las tres (10 sesiones × 5 peticiones por réplica). Se
+monitoreó `pg_stat_activity` en Postgres cada segundo durante toda la
+corrida: el conteo de conexiones se mantuvo **estable en 9 conexiones de
+aplicación** (3 réplicas × pool de 3) durante todo el pico de carga,
+nunca más. `/diagnostics` de cada réplica confirmó `pool_size: 3` (el
+máximo configurado) en las tres al mismo tiempo. La fórmula se sostiene:
+9 = 3 × 3, ni una conexión más.
+
+**2. Presupuesto de conexiones y el umbral de PgBouncer.**
+El Postgres de desarrollo (`postgres:16-alpine`, default de fábrica) tiene
+`max_connections = 100`. Con `superuser_reserved_connections` (3 por
+defecto) reservadas, quedan ~97 conexiones utilizables para la
+aplicación. Con la fórmula de arriba, **el umbral para necesitar
+PgBouncer (u otro pooler externo) es cuando `nº_de_réplicas × max_pool_size`
+se acerca a ese número** — por ejemplo, con `max_pool_size=5` por
+réplica, el límite práctico ronda las **19 réplicas** (19 × 5 = 95) antes
+de agotar `max_connections`; con `max_pool_size=10`, el límite baja a
+**~9 réplicas**. Este número es específico de esta instancia de Postgres
+(el `max_connections` real de producción puede ser mayor o menor, y hay
+que restarle lo que usen otros clientes — pgAdmin, otros servicios); la
+fórmula general es: `nº_réplicas_máximo ≈ (max_connections − reservadas − otros_clientes) ÷ max_pool_size`.
+
+**3. Comportamiento al saturar el semáforo: espera o falla limpio, nunca encola infinito.**
+Con `max_concurrency=2` y `acquire_timeout_seconds` generoso (3s), 20
+sesiones concurrentes contra una réplica completaron **50/50 peticiones
+exitosas** (0 fallos) — todas esperaron su turno y fueron atendidas,
+con latencia p95 de ~2.03s (el costo real de encolarse detrás de un
+límite de 2). Con el mismo `max_concurrency=2` pero
+`acquire_timeout_seconds=0.05` (deliberadamente agresivo), la misma carga
+de 20 sesiones concurrentes produjo **13/60 peticiones rechazadas
+limpiamente** (`ToolError`: "La base de datos de clientes no está
+disponible en este momento") en vez de acumularse indefinidamente —
+confirmando las dos rutas posibles del diseño: esperar (si el timeout lo
+permite) o fallar limpio (si no), nunca una cola sin fin. El circuito
+**permaneció `closed`** durante toda esta prueba: saturación de
+concurrencia NO cuenta como fallo de infraestructura para el breaker (es
+la distinción documentada en la Fase 2).
+
+**4. `/ready` bajo carga y con una fuente caída: nunca se degrada.**
+Con el stub de saldos apagado (`docker stop`) — el conector con
+`healthy: false` y el circuito de esa fuente `open` — y simultáneamente
+saturando el semáforo de Postgres con 20 sesiones concurrentes contra un
+límite de 2, se sondeó `/ready` continuamente: **45/45 respuestas fueron
+`200`**, ni una sola `503`. `/ready` siguió respondiendo únicamente sobre
+la salud del proceso, exactamente como se diseñó desde la Fase 2 — nunca
+se acopla a la salud de los conectores, sin importar cuánta carga o cuántas
+fuentes estén caídas.
+
+**5. El circuit breaker con múltiples réplicas: independiente por diseño, confirmado.**
+Con dos réplicas reales corriendo, se detuvo el stub de saldos y se le
+mandaron 6 peticiones fallidas seguidas SOLO a la réplica A. Resultado en
+`/diagnostics` de cada una, al mismo tiempo:
+
+```
+Réplica A (recibió las 6 peticiones fallidas): circuit_state = "open"
+Réplica B (no recibió tráfico hacia saldo_api): circuit_state = "closed", healthy = false
+```
+
+Cada réplica descubre la fuente caída de forma completamente
+independiente, con su propio conteo de fallos — exactamente la decisión
+de diseño de la Fase 2, ahora confirmada con réplicas reales en vez de en
+teoría. En la práctica esto implica que, con N réplicas, una fuente que
+se recupera recibe hasta N sondeos independientes en medio-abierto (uno
+por réplica que la tenía marcada como caída), no uno solo coordinado.
+
+**6. Graceful shutdown durante una rotación de réplicas — con matices reales, no solo el camino feliz.**
+Se corrió el server en un contenedor Docker real (Linux; ver el porqué
+más abajo) con carga concurrente sostenida (3 sesiones, cientos de
+peticiones) y se ejecutó `docker stop` (SIGTERM real vía el PID 1 del
+contenedor) a mitad de la corrida. Resultado, leído directamente de los
+logs:
+
+- **470/470 tool-calls que ya habían arrancado se completaron con éxito**
+  (`tool_invocation_completed` con `result: success` para cada
+  `CallToolRequest` procesado) — ninguna quedó a medias.
+- El apagado completo (`Shutting down` → `Application shutdown complete`)
+  tomó **~130 ms**, muy por debajo del
+  `MCP_CORP_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS` configurado (8s): uvicorn
+  no necesitó agotar ese margen porque las peticiones request/response ya
+  estaban resueltas.
+- **Hallazgo no anticipado:** el stream SSE de larga duración que usa el
+  transporte Streamable HTTP de MCP para cada sesión SÍ se corta de forma
+  abrupta al recibir SIGTERM (`ASGI callable returned without completing
+  response` en los logs de uvicorn), en vez de esperar el timeout de
+  gracia completo. El cliente ve un `ReadError` al intentar cerrar
+  ordenadamente su sesión. La garantía que sí se sostiene — y es la que
+  importa — es que ninguna *tool call* queda inconclusa; lo que se corta
+  es la conexión de transporte de la sesión, no una operación de negocio
+  en curso. Documentado como hallazgo real, no maquillado: el diseño
+  cumple su promesa central (no tools a medias), pero con un matiz de
+  transporte que vale la pena conocer si se opera esto en producción.
+
+**¿Por qué en un contenedor Docker (Linux) y no como proceso nativo de Windows?**
+Ver "Qué NO se pudo verificar" abajo — Windows no entrega SIGTERM real a
+un proceso hijo desde este sandbox; un contenedor Linux sí, y es
+exactamente el mismo mecanismo que usarían Swarm/Kubernetes en
+producción (ambos corren contenedores Linux y envían SIGTERM real al
+apagar una réplica).
+
+### Qué NO se pudo verificar por límites del entorno
+
+- **Un Swarm o cluster OpenShift/Kubernetes real.** Solo Docker Desktop
+  (un único daemon, sin múltiples nodos ni Traefik real corriendo). Las
+  verificaciones de arriba se hicieron con réplicas reales (procesos y
+  contenedores independientes) apuntando a la misma infraestructura
+  compartida, que es el mecanismo real detrás de "una réplica" — pero sin
+  un balanceador real (Traefik/Service de Kubernetes) al frente
+  redirigiendo tráfico entre ellas.
+- **Graceful shutdown enviando SIGTERM a un proceso nativo de Windows.**
+  Windows no invoca los manejadores de señal que instala uvicorn cuando
+  se envía SIGTERM a un proceso hijo desde otro proceso — `os.kill(pid,
+  SIGTERM)` y `taskkill` (sin `/F`) terminan el proceso abruptamente sin
+  darle oportunidad de drenar. Se confirmó el rechazo explícito de
+  Windows (`taskkill` sin `/F`: "Este proceso se puede terminar solo de
+  forma forzada"). Por eso la verificación #6 se hizo contra un
+  contenedor Docker (Linux real dentro), que si recibe y maneja SIGTERM
+  correctamente — el mismo mecanismo que usa un Swarm o Kubernetes reales
+  en producción.
+- **Manifiestos de OpenShift contra un cluster real.** Sintaxis validada
+  (YAML bien formado, coherente con la documentación de la API de
+  Kubernetes/OpenShift), pero nunca aplicados con `oc apply` / `kubectl
+  apply` contra un cluster.
+
+## Modo producción y fail-closed del HMAC (Fase 4, Parte B)
+
+Pendiente heredado de la Fase 3: antes, si `MCP_CORP_AUDIT_HMAC_SECRET`
+venía vacía, el server solo registraba un warning y arrancaba igual — un
+HMAC con clave vacía es determinista y públicamente reproducible (el
+mismo problema que motivó abandonar el hash plano), así que ese
+enmascaramiento no protegía nada.
+
+Ahora, `Settings` (en `config.py`) tiene un validador que revisa la
+combinación al construirse: **si `MCP_CORP_ENVIRONMENT=production` y
+`MCP_CORP_AUDIT_HMAC_SECRET` está vacía, el proceso no arranca** —
+`pydantic.ValidationError` desde el primer momento, antes de abrir
+ningún conector. En cualquier otro entorno (`local`, `staging`), una
+clave vacía sigue siendo aceptable y solo produce el warning de
+`server.py` — apto para desarrollo, no para el entorno cuyos logs sí se
+auditan de verdad.
 
 ## Configuración
 
@@ -297,6 +479,7 @@ src/mcp_corp/
 tests/
 ├── test_audit.py                       # unitarios de auditoría: enmascaramiento, forma del log
 ├── test_identifiers.py                 # unitarios de normalización/checksum (Fase 4)
+├── test_config.py                      # fail-closed del HMAC en modo producción (Fase 4)
 ├── connectors/
 │   ├── test_resilience.py              # unitarios de la capa de resiliencia (conector falso)
 │   ├── test_postgres_integration.py    # integración contra Postgres real
@@ -306,9 +489,9 @@ tests/
     └── test_tools_integration.py       # integración contra Postgres + stub de saldos reales
 
 deploy/
-├── swarm/                 # docker-compose.yml para Docker Swarm/Portainer
-├── dev/                    # postgres-seed.sql + saldo_api_stub.py para docker-compose.dev.yml
-└── openshift/              # placeholder — manifiestos K8s en otra fase
+├── swarm/                  # docker-compose.yml para Docker Swarm/Portainer
+├── dev/                     # postgres-seed.sql + saldo_api_stub.py + load_test.py
+└── openshift/               # Deployment/Service/Route/ConfigMap + Secret de ejemplo (Fase 4)
 ```
 
 ## Decisiones de diseño
@@ -680,10 +863,18 @@ importa.
 
 ## Próximas fases (fuera de alcance aquí)
 
-- Fase 4+: gateway de gobierno, más tools de negocio, más conectores
+- Fase 5+: gateway de gobierno, más tools de negocio, más conectores
   (sistemas legacy) sobre el mismo protocolo `Connector` / `ResilientExecutor`.
 - Token bucket para límite de tasa (req/s) por fuente — hoy solo hay
   límite de concurrencia (ver `rate_limit_per_second` en `config.py`).
 - Estado del circuit breaker compartido entre réplicas (hoy es por
   réplica, a propósito — ver "Decisiones de diseño").
-- Manifiestos de OpenShift/Kubernetes (`deploy/openshift/`).
+- Verificar los manifiestos de OpenShift/Kubernetes contra un cluster real
+  (`deploy/openshift/`) — la sintaxis y la estructura están listas, pero
+  nunca se aplicaron con `oc`/`kubectl`.
+- PgBouncer (u otro pooler externo) delante de Postgres, cuando el número
+  de réplicas se acerque al umbral documentado en "Verificaciones bajo
+  carga".
+- Continuidad de correlación del HMAC de auditoría durante una rotación
+  de clave planificada (hoy rotar rompe la correlación histórica a
+  propósito; ver Fase 3).

@@ -73,6 +73,66 @@ class PostgresSettings(BaseModel):
     )
 
 
+class SaldoApiSettings(BaseModel):
+    """Config de la fuente de saldos (API REST) + resiliencia propia.
+
+    Misma filosofía que `PostgresSettings`: concurrencia, timeouts y breaker
+    son por-fuente, nunca compartidos con Postgres ni con ninguna otra API
+    que se sume después.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description="Si es False, el conector no se instancia ni se conecta al arrancar.",
+    )
+    base_url: str = Field(
+        default="",
+        description="URL base del servicio de saldos (esquema, host y puerto), p. ej. http://localhost:8080.",
+    )
+    request_timeout_seconds: float = Field(
+        default=5.0,
+        description=(
+            "Timeout del cliente httpx a nivel de transporte. Es una defensa adicional al "
+            "operation_timeout_seconds de la capa de resiliencia, no un sustituto."
+        ),
+    )
+
+    # Resiliencia (ver ResilienceConfig en connectors/resilience.py)
+    max_concurrency: int = Field(
+        default=10,
+        description="Operaciones simultáneas permitidas hacia el servicio de saldos desde esta réplica.",
+    )
+    acquire_timeout_seconds: float = Field(
+        default=2.0,
+        description="Segundos a esperar por un slot de concurrencia antes de fallar limpio.",
+    )
+    operation_timeout_seconds: float = Field(
+        default=5.0,
+        description="Timeout por operación individual contra el servicio de saldos.",
+    )
+    circuit_failure_threshold: int = Field(
+        default=5,
+        description="Fallos de infraestructura consecutivos para abrir el circuito.",
+    )
+    circuit_reset_timeout_seconds: float = Field(
+        default=30.0,
+        description="Segundos que el circuito permanece abierto antes de pasar a medio-abierto.",
+    )
+    circuit_success_threshold: int = Field(
+        default=2,
+        description="Éxitos consecutivos en medio-abierto requeridos para volver a cerrar el circuito.",
+    )
+
+    # Hueco conocido, no resuelto en esta fase: el semáforo limita
+    # CONCURRENCIA, no TASA. Si el servicio de saldos declara un techo en
+    # req/s, este campo es el punto de extensión: hará falta un token
+    # bucket por encima del semáforo, que hoy no existe.
+    rate_limit_per_second: float | None = Field(
+        default=None,
+        description="Reservado para un futuro limitador de tasa; no aplicado todavía.",
+    )
+
+
 class Settings(BaseSettings):
     """Configuración del servidor MCP, con defaults sensatos para local/dev."""
 
@@ -114,6 +174,7 @@ class Settings(BaseSettings):
     # REST, sistema legacy) suma su propio `*Settings` aquí, con su propia
     # concurrencia, timeout y breaker — nunca comparten presupuesto.
     postgres: PostgresSettings = Field(default_factory=PostgresSettings)
+    saldo_api: SaldoApiSettings = Field(default_factory=SaldoApiSettings)
 
     # Apagado
     graceful_shutdown_timeout_seconds: float = Field(

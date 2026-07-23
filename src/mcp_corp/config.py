@@ -7,8 +7,70 @@ se puede sobreescribir vía variables de entorno (o un `.env` en desarrollo).
 
 from __future__ import annotations
 
-from pydantic import Field
+from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class PostgresSettings(BaseModel):
+    """Config de la fuente Postgres: conexión + resiliencia propia.
+
+    Todos los campos de resiliencia (concurrencia, timeouts, breaker) son
+    por-fuente a propósito: la saturación de una fuente nunca debe robarle
+    presupuesto de espera o de circuito a otra (ver `connectors/resilience.py`).
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description="Si es False, el conector no se instancia ni se conecta al arrancar.",
+    )
+    dsn: str = Field(
+        default="",
+        description="Cadena de conexión libpq completa. Solo desde entorno/.env, nunca hardcodeada.",
+    )
+
+    # Pool de conexiones (psycopg_pool.AsyncConnectionPool)
+    min_pool_size: int = Field(default=1, description="Conexiones mínimas mantenidas abiertas por réplica.")
+    max_pool_size: int = Field(default=10, description="Conexiones máximas por réplica.")
+    pool_open_timeout_seconds: float = Field(
+        default=10.0,
+        description="Segundos a esperar a que el pool alcance min_pool_size al arrancar.",
+    )
+
+    # Resiliencia (ver ResilienceConfig en connectors/resilience.py)
+    max_concurrency: int = Field(
+        default=10,
+        description="Operaciones simultáneas permitidas hacia Postgres desde esta réplica.",
+    )
+    acquire_timeout_seconds: float = Field(
+        default=2.0,
+        description="Segundos a esperar por un slot de concurrencia antes de fallar limpio.",
+    )
+    operation_timeout_seconds: float = Field(
+        default=5.0,
+        description="Timeout por operación individual contra Postgres.",
+    )
+    circuit_failure_threshold: int = Field(
+        default=5,
+        description="Fallos de infraestructura consecutivos para abrir el circuito.",
+    )
+    circuit_reset_timeout_seconds: float = Field(
+        default=30.0,
+        description="Segundos que el circuito permanece abierto antes de pasar a medio-abierto.",
+    )
+    circuit_success_threshold: int = Field(
+        default=2,
+        description="Éxitos consecutivos en medio-abierto requeridos para volver a cerrar el circuito.",
+    )
+
+    # Hueco conocido, no resuelto en esta fase: el semáforo de arriba limita
+    # CONCURRENCIA (operaciones simultáneas), no TASA (operaciones por
+    # segundo). Si Postgres (o el PgBouncer delante) declara un techo en
+    # req/s, este campo es el punto de extensión: hará falta un token
+    # bucket por encima del semáforo, que hoy no existe.
+    rate_limit_per_second: float | None = Field(
+        default=None,
+        description="Reservado para un futuro limitador de tasa; no aplicado todavía.",
+    )
 
 
 class Settings(BaseSettings):
@@ -16,6 +78,7 @@ class Settings(BaseSettings):
 
     model_config = SettingsConfigDict(
         env_prefix="MCP_CORP_",
+        env_nested_delimiter="__",
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
@@ -47,15 +110,10 @@ class Settings(BaseSettings):
         description="Nivel de log estándar de Python (DEBUG, INFO, WARNING, ERROR, CRITICAL).",
     )
 
-    # Conectores (placeholders para la Fase 2)
-    default_connector_pool_size: int = Field(
-        default=10,
-        description="Tamaño de pool de conexiones por defecto para futuros conectores de datos.",
-    )
-    default_connector_timeout_seconds: float = Field(
-        default=5.0,
-        description="Timeout por defecto (segundos) para llamadas a fuentes de datos externas.",
-    )
+    # Conectores: un bloque de config por fuente. Cada fuente nueva (API
+    # REST, sistema legacy) suma su propio `*Settings` aquí, con su propia
+    # concurrencia, timeout y breaker — nunca comparten presupuesto.
+    postgres: PostgresSettings = Field(default_factory=PostgresSettings)
 
     # Apagado
     graceful_shutdown_timeout_seconds: float = Field(

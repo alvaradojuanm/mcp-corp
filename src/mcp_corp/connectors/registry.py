@@ -32,6 +32,9 @@ class ConnectorRegistry:
     def get(self, name: str) -> ManagedConnector:
         return self._connectors[name]
 
+    def __contains__(self, name: str) -> bool:
+        return name in self._connectors
+
     async def connect_all(self) -> None:
         for managed in self._connectors.values():
             await managed.connector.connect()

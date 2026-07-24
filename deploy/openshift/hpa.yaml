@@ -1,0 +1,45 @@
+# HorizontalPodAutoscaler OPCIONAL — muestra la ruta de autoescalado, no
+# se aplica por defecto (no está en kustomization.yaml). Requiere
+# metrics-server (Kubernetes) o el stack de métricas de OpenShift
+# funcionando en el cluster para que `resources.requests.cpu` tenga
+# semántica de porcentaje de uso.
+#
+# ⚠️ Si activas esto, recuerda la fórmula de capacidad: cada réplica nueva
+# que el HPA cree debe seguir respetando `límite por réplica = techo de la
+# fuente ÷ nº de réplicas`. El autoescalado basado en CPU no sabe nada del
+# techo de conexiones de Postgres ni del límite de la API de saldos — un
+# pico de CPU podría escalar por encima de lo que la fuente tolera.
+# Mitígalo bajando MAX_POOL_SIZE/MAX_CONCURRENCY en el ConfigMap en
+# proporción a `maxReplicas`, o no actives esto hasta tener un plan claro
+# para ese caso.
+#
+# Para activarlo: agrega "hpa.yaml" a la lista `resources` de
+# kustomization.yaml y AJUSTA `spec.replicas` en deployment.yaml para que
+# dependas del HPA, no de un valor fijo (el HPA lo sobrescribe de todas
+# formas una vez activo).
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: mcp-corp
+  labels:
+    app: mcp-corp
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: mcp-corp
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleDown:
+      # Evita bajar réplicas de golpe ante un valle de tráfico momentáneo
+      # — cada bajada de réplica reduce la capacidad total hacia las
+      # fuentes (ver la fórmula de capacidad arriba).
+      stabilizationWindowSeconds: 300

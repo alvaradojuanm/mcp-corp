@@ -36,7 +36,7 @@ spec:
       terminationGracePeriodSeconds: 20
       containers:
         - name: mcp-corp
-          image: mcp-corp:latest
+          image: mcp-corp:1.0.1
           ports:
             - containerPort: 8000
               name: http
@@ -74,8 +74,23 @@ spec:
               cpu: "500m"
               memory: "256Mi"
           securityContext:
-            # Coherente con el Dockerfile (usuario no-root, uid/gid 1000).
+            # NO se fija runAsUser/runAsGroup a propósito — ver el porqué
+            # en el README de esta carpeta ("UIDs arbitrarios de
+            # OpenShift"). En resumen: el Dockerfile define un usuario fijo
+            # (mcpcorp, uid/gid 1000) para Docker/Swarm, pero la SCC
+            # `restricted` (default de OpenShift) exige que el pod corra
+            # con un UID del rango asignado dinámicamente al namespace, y
+            # RECHAZA el pod si se fuerza un runAsUser fuera de ese rango.
+            # La app es compatible con cualquier UID sin cambios: no
+            # escribe nada al filesystem en runtime (stateless,
+            # PYTHONDONTWRITEBYTECODE=1, sin bytecode ni caché local), así
+            # que dejar que la plataforma asigne el UID es seguro. En
+            # Kubernetes vanilla (sin esa restricción), el contenedor
+            # simplemente hereda el uid 1000 del Dockerfile si no se
+            # sobreescribe aquí — mismo resultado que en Swarm.
             runAsNonRoot: true
-            runAsUser: 1000
-            runAsGroup: 1000
             allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault

@@ -1,8 +1,16 @@
-# Amarra los manifiestos de esta carpeta. `secret.example.yaml` NO se
-# incluye a propósito: es una plantilla de referencia, no algo para
-# aplicar tal cual (ver README de esta carpeta para cómo crear el Secret
-# real). Con `kubectl apply -k` / `oc apply -k` sobre este directorio se
-# aplican configmap, deployment, service y route.
+# Amarra los manifiestos de esta carpeta. Con `kubectl apply -k` / `oc
+# apply -k` sobre este directorio se aplican configmap, deployment,
+# service y route (asume destino OpenShift, el caso principal de este
+# proyecto — ver README raíz).
+#
+# NO incluidos aquí, aplícalos aparte según haga falta:
+#   - secret.example.yaml -> plantilla de referencia, NUNCA aplicar tal
+#     cual (ver "Cómo se probaría..." en el README de esta carpeta).
+#   - ingress.yaml -> alternativa a route.yaml para Kubernetes vanilla
+#     (sin OpenShift). Si tu destino es K8s vanilla, quita route.yaml de
+#     la lista de abajo y aplica `kubectl apply -f ingress.yaml` aparte.
+#   - hpa.yaml -> autoescalado opcional, ver advertencia de capacidad en
+#     ese archivo antes de activarlo.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 

@@ -1,0 +1,197 @@
+# Stack de Docker Swarm para el entorno PRE-PRODUCTIVO de mcp-corp.
+# Pensado para Portainer > Stacks > Add stack > Upload (o `docker stack
+# deploy -c mcp-corp-stack.yml mcp-corp`).
+#
+# Es la versión completa de deploy/swarm/docker-compose.yml (esa quedó de
+# la Fase 4 como demo mínima sobre HTTP plano); esta añade: secretos
+# montados como archivo, HTTPS con Let's Encrypt, límites de recursos,
+# logging acotado, y el stub de saldos como servicio opcional.
+#
+# ═══════════════════════════════════════════════════════════════════════
+# PRERREQUISITOS — hazlos ANTES de desplegar este stack
+# ═══════════════════════════════════════════════════════════════════════
+#
+# 1) IMAGEN CARGADA EN TODOS LOS NODOS DEL SWARM.
+#    Esta imagen NO viene de un registro (se transportó con `docker save`
+#    / `docker load`, ver deploy/README.md). Docker Swarm NO distribuye
+#    imágenes locales entre nodos por sí solo: si el swarm tiene más de un
+#    nodo y la imagen solo está cargada en uno, las réplicas que el
+#    scheduler intente colocar en los otros nodos quedarán en `Pending`
+#    SIN un error claro que lo diga — hay que revisar
+#    `docker service ps mcp-corp_mcp-corp` y ver "no suitable node" para
+#    darse cuenta. Carga la imagen en cada nodo antes de desplegar:
+#      docker load -i mcp-corp-1.0.1.tar   # repetir en cada nodo
+#
+# 2) SECRETOS DE DOCKER SWARM (ver Bloque 1 / config.py:
+#    _load_file_secrets_into_environ, y el detalle completo en
+#    deploy/README.md). Crea estos DOS como mínimo, uno por uno, ANTES de
+#    desplegar el stack — Swarm no permite desplegar un servicio que
+#    referencia un secreto inexistente:
+#
+#      printf '%s' 'EL-VALOR-REAL-DEL-HMAC' | docker secret create mcp_corp_audit_hmac_secret -
+#      printf '%s' 'postgresql://usuario:password@host:5432/basededatos' | docker secret create mcp_corp_postgres_dsn -
+#
+#    El HMAC: genera uno con `python -c "import secrets; print(secrets.token_hex(32))"`.
+#    Debe ser IGUAL en todas las réplicas — por eso va en un secreto de
+#    Swarm (que ya se distribuye igual a todas), no en una variable local
+#    por nodo.
+#
+# 3) RED EXTERNA "traefik_public" — overlay, attachable, con Traefik ya
+#    corriendo como edge router (patrón estándar de Portainer). Si no
+#    existe: `docker network create --driver overlay --attachable traefik_public`.
+#
+# 4) RED INTERNA PARA ALCANZAR POSTGRES — TODO: nombra aquí la red real.
+#    Si Postgres corre COMO SERVICIO en este mismo swarm, es otra red
+#    overlay (interna, sin `attachable` si no hace falta acceso externo).
+#    Si Postgres es una instancia externa al swarm (RDS, un host aparte),
+#    puede que no haga falta una red dedicada — depende de cómo resuelva
+#    el DNS/IP el DSN del secreto `mcp_corp_postgres_dsn`. Ajusta la
+#    sección `networks:` de abajo y el bloque `networks:` del servicio
+#    según corresponda; tal como está, el placeholder se llama
+#    `postgres_internal` y NO existe todavía.
+#
+# 5) DOMINIO DEL ROUTER DE TRAEFIK — TODO: reemplaza
+#    `TODO-mcp-corp.example.com` por el dominio real antes de desplegar.
+#
+# 6) URL DE LA API DE SALDOS — TODO: `MCP_CORP_SALDO_API__BASE_URL` abajo
+#    apunta a un placeholder. En pre-productivo real, sustitúyelo por la
+#    URL del core bancario/API de saldos real. Si en cambio quieres
+#    levantar el STUB de desarrollo para demostrar la tool compuesta de
+#    punta a punta (nunca en producción real), ver
+#    deploy/swarm/saldo-api-stub-stack.yml y apunta esta URL al servicio
+#    de ese stack.
+#
+# ═══════════════════════════════════════════════════════════════════════
+# FÓRMULA DE CAPACIDAD — reajusta cada vez que cambies `deploy.replicas`
+# ═══════════════════════════════════════════════════════════════════════
+# límite por réplica = techo de la fuente ÷ número de réplicas
+#
+# Para Postgres: max_connections de esa instancia, MENOS lo reservado
+# para superusuario (superuser_reserved_connections, 3 por defecto) MENOS
+# lo que ya usen otros clientes (pgAdmin, otros servicios) — trabaja sobre
+# ese número REAL, no sobre max_connections a secas (medido en la Fase 4:
+# con max_connections=100 de fábrica, ~85 conexiones son las realmente
+# disponibles para esta aplicación, no 100).
+#
+# Con 2 réplicas (el arranque de este stack) y, p. ej., 85 conexiones
+# útiles repartidas con margen: MCP_CORP_POSTGRES__MAX_POOL_SIZE=10 por
+# réplica (2 × 10 = 20, bien lejos del techo) es un punto de partida
+# conservador — súbelo solo si mediste que hace falta más throughput.
+#
+# ═══════════════════════════════════════════════════════════════════════
+# CÓMO ESCALAR RÉPLICAS DESDE PORTAINER
+# ═══════════════════════════════════════════════════════════════════════
+# Stacks → mcp-corp → Services → mcp-corp → "Scale service" (o edita
+# `deploy.replicas` abajo y vuelve a desplegar el stack). Con
+# `update_config.order: start-first`, las réplicas nuevas arrancan y pasan
+# su healthcheck ANTES de que Traefik deje de enrutar a las viejas; cada
+# réplica saliente drena sus peticiones en curso durante
+# `MCP_CORP_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS` antes de terminar (medido
+# en la Fase 4: 470/470 tool-calls en curso se completaron durante un
+# apagado real bajo carga — ver el README para el detalle y el matiz
+# sobre el corte del stream SSE de cada sesión MCP en cada rotación).
+
+version: "3.8"
+
+services:
+  mcp-corp:
+    image: mcp-corp:1.0.1
+    environment:
+      MCP_CORP_SERVICE_NAME: mcp-corp
+      MCP_CORP_ENVIRONMENT: production
+      MCP_CORP_HOST: "0.0.0.0"
+      MCP_CORP_PORT: "8000"
+      MCP_CORP_LOG_LEVEL: INFO
+      MCP_CORP_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS: "10"
+
+      # Secretos montados como archivo por Swarm (ver `secrets:` abajo) y
+      # resueltos por config.py::_load_file_secrets_into_environ al
+      # arrancar (patrón MCP_CORP_*_FILE, ver README "Secretos como
+      # archivo"). Los nombres de archivo (/run/secrets/<target>) los fija
+      # el `target:` de cada entrada en `secrets:` más abajo.
+      MCP_CORP_AUDIT_HMAC_SECRET_FILE: /run/secrets/audit_hmac_secret
+      MCP_CORP_POSTGRES__DSN_FILE: /run/secrets/postgres_dsn
+
+      MCP_CORP_POSTGRES__ENABLED: "true"
+      MCP_CORP_POSTGRES__MIN_POOL_SIZE: "1"
+      MCP_CORP_POSTGRES__MAX_POOL_SIZE: "10"
+      MCP_CORP_POSTGRES__MAX_CONCURRENCY: "10"
+
+      # TODO: URL real del servicio de saldos (ver prerrequisito 6 arriba).
+      MCP_CORP_SALDO_API__ENABLED: "true"
+      MCP_CORP_SALDO_API__BASE_URL: "http://TODO-saldo-api.example.internal:8080"
+      MCP_CORP_SALDO_API__MAX_CONCURRENCY: "10"
+    secrets:
+      - source: mcp_corp_audit_hmac_secret
+        target: audit_hmac_secret
+      - source: mcp_corp_postgres_dsn
+        target: postgres_dsn
+    networks:
+      - traefik_public
+      - postgres_internal
+    healthcheck:
+      # Mismo mecanismo que el HEALTHCHECK del Dockerfile: la imagen base
+      # (python:3.12-slim) NO trae curl ni wget, así que se usa el propio
+      # intérprete de Python con urllib (stdlib, siempre disponible).
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      replicas: 2
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+        window: 120s
+      update_config:
+        parallelism: 1
+        delay: 10s
+        order: start-first
+        failure_action: rollback
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+        reservations:
+          cpus: "0.1"
+          memory: 128M
+      labels:
+        - "traefik.enable=true"
+        - "traefik.docker.network=traefik_public"
+
+        # Router HTTPS (principal). TODO: reemplaza el dominio.
+        - "traefik.http.routers.mcp-corp.rule=Host(`TODO-mcp-corp.example.com`)"
+        - "traefik.http.routers.mcp-corp.entrypoints=websecure"
+        - "traefik.http.routers.mcp-corp.tls=true"
+        - "traefik.http.routers.mcp-corp.tls.certresolver=letsencrypt"
+
+        # Router HTTP: solo existe para redirigir a HTTPS.
+        - "traefik.http.routers.mcp-corp-http.rule=Host(`TODO-mcp-corp.example.com`)"
+        - "traefik.http.routers.mcp-corp-http.entrypoints=web"
+        - "traefik.http.routers.mcp-corp-http.middlewares=mcp-corp-https-redirect"
+        - "traefik.http.middlewares.mcp-corp-https-redirect.redirectscheme.scheme=https"
+
+        # Balanceo entre réplicas + healthcheck activo de Traefik.
+        - "traefik.http.services.mcp-corp.loadbalancer.server.port=8000"
+        - "traefik.http.services.mcp-corp.loadbalancer.healthcheck.path=/health"
+        - "traefik.http.services.mcp-corp.loadbalancer.healthcheck.interval=10s"
+
+networks:
+  traefik_public:
+    external: true
+  # TODO: nombre real de la red que alcanza Postgres (ver prerrequisito 4).
+  postgres_internal:
+    external: true
+
+secrets:
+  mcp_corp_audit_hmac_secret:
+    external: true
+  mcp_corp_postgres_dsn:
+    external: true

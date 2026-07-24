@@ -1,0 +1,63 @@
+# Stack OPCIONAL: el stub de saldos (deploy/dev/saldo_api_stub.py) corriendo
+# en el mismo swarm, para que el entorno pre-productivo pueda demostrar
+# `resumen_cliente` de punta a punta sin depender de una API de saldos real.
+#
+# ⚠️ NO USAR EN PRODUCCIÓN REAL. Es el mismo stub determinista de la Fase 3
+# (sin autenticación, datos sembrados a mano, una cédula reservada que
+# fuerza un 500 a propósito). Solo sirve para demos y validación manual del
+# entorno pre-productivo.
+#
+# Uso:
+#   docker stack deploy -c deploy/swarm/saldo-api-stub-stack.yml mcp-corp-saldo-stub
+#
+# Luego, en mcp-corp-stack.yml, apunta:
+#   MCP_CORP_SALDO_API__BASE_URL: "http://saldo-api-stub:8080"
+# (el nombre "saldo-api-stub" resuelve por DNS de Swarm si ambos stacks
+# comparten la red `postgres_internal` — o la red interna que hayas usado;
+# renómbrala aquí igual que en mcp-corp-stack.yml para que compartan red).
+
+version: "3.8"
+
+services:
+  saldo-api-stub:
+    image: python:3.12-alpine
+    # El script del stub se monta desde un bind mount del host: es un
+    # archivo de dev sin build propio. Copia deploy/dev/saldo_api_stub.py
+    # a esta ruta en el nodo donde corra esta réplica (con un único
+    # replica, como abajo, no hace falta distribuirlo a todos los nodos).
+    command: ["python", "/app/saldo_api_stub.py"]
+    volumes:
+      - type: bind
+        source: /opt/mcp-corp/saldo_api_stub.py # TODO: ruta real en el host
+        target: /app/saldo_api_stub.py
+        read_only: true
+    networks:
+      - postgres_internal # TODO: misma red interna que usa mcp-corp-stack.yml
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      replicas: 1 # el stub guarda estado en memoria; más de 1 réplica daría respuestas inconsistentes entre sí
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+      resources:
+        limits:
+          cpus: "0.2"
+          memory: 128M
+        reservations:
+          cpus: "0.05"
+          memory: 64M
+
+networks:
+  postgres_internal:
+    external: true

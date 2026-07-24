@@ -1,6 +1,6 @@
 [project]
 name = "mcp-corp"
-version = "0.1.0"
+version = "1.0.2"
 description = "Implementación de referencia de un servidor MCP corporativo, stateless, sobre Streamable HTTP."
 readme = "README.md"
 requires-python = ">=3.12"

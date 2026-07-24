@@ -15,21 +15,21 @@ se enfoca en Swarm/Portainer, que es el destino inmediato de esta fase.
 # claro ("no matching manifest") si la arquitectura no coincide
 # exactamente. Con estos flags, `docker save` exporta una imagen de una
 # sola plataforma, la del host donde se construyó.
-docker build --provenance=false --sbom=false -t mcp-corp:1.0.1 .
+docker build --provenance=false --sbom=false -t mcp-corp:1.0.2 .
 
 # Exportar a un .tar (puede pesar ~80-100 MB con esta imagen).
-docker save -o mcp-corp-1.0.1.tar mcp-corp:1.0.1
+docker save -o mcp-corp-1.0.2.tar mcp-corp:1.0.2
 
 # Transferir el .tar al/los nodo(s) destino (scp, un share de red, un USB
 # — lo que aplique en tu entorno). Ejemplo con scp:
-scp mcp-corp-1.0.1.tar usuario@nodo-swarm:/tmp/
+scp mcp-corp-1.0.2.tar usuario@nodo-swarm:/tmp/
 
 # En CADA nodo del swarm donde el scheduler pueda colocar una réplica:
-docker load -i /tmp/mcp-corp-1.0.1.tar
+docker load -i /tmp/mcp-corp-1.0.2.tar
 docker images mcp-corp   # confirma que quedó cargada
 ```
 
-> **`mcp-corp-1.0.1.tar` NUNCA debe ir al repositorio de git** — son
+> **`mcp-corp-1.0.2.tar` NUNCA debe ir al repositorio de git** — son
 > decenas de MB de binario. Ya está excluido en `.gitignore` (`*.tar`).
 
 ⚠️ **Si el swarm tiene más de un nodo, repite `docker load` en TODOS.**

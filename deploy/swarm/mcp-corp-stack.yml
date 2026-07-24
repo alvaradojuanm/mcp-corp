@@ -12,7 +12,7 @@
 #
 # -----------------------------------------------------------------------------
 # PRERREQUISITOS — todos cumplidos:
-#   Imagen:    mcp-corp:1.0.1 cargada en el nodo (docker load)
+#   Imagen:    mcp-corp:1.0.2 cargada en el nodo (docker load)
 #   Secretos:  mcp_corp_audit_hmac_secret · mcp_corp_postgres_dsn
 #   Redes:     traefik_public · agent_network
 #   Base:      mcp_corp (owner mcp_corp) en postgres_18_general_postgres
@@ -36,7 +36,7 @@ version: "3.8"
 
 services:
   mcp-corp:
-    image: mcp-corp:1.0.1
+    image: mcp-corp:1.0.2
 
     environment:
       MCP_CORP_SERVICE_NAME: mcp-corp

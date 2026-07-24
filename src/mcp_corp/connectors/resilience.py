@@ -180,6 +180,23 @@ class CircuitBreaker:
             if self._consecutive_failures >= self._config.failure_threshold:
                 self._transition(CircuitState.OPEN)
 
+    async def force_open(self) -> None:
+        """Abre el circuito manualmente, sin que haya habido una operación
+        real que cuente como fallo (Fase 6, Bug 2).
+
+        Se usa cuando el conector no logra conectar (o no pasa su propio
+        `health()`) al arrancar: sin esto, `/diagnostics` mostraría el
+        circuito `closed` durante los primeros `failure_threshold`
+        intentos reales, aunque la fuente ya se sabía caída desde el
+        arranque. El resto del ciclo de vida del breaker (medio-abierto
+        tras `reset_timeout_seconds`, cierre tras `success_threshold`
+        éxitos) sigue funcionando igual después de esto — no hace falta
+        ningún método de "recuperación" simétrico.
+        """
+        async with self._lock:
+            if self._state is not CircuitState.OPEN:
+                self._transition(CircuitState.OPEN)
+
     def _transition(self, new_state: CircuitState) -> None:
         old_state = self._state
         self._state = new_state
@@ -292,3 +309,7 @@ class ResilientExecutor:
             "in_flight": self._in_flight,
             "max_concurrency": self.config.max_concurrency,
         }
+
+    async def force_open(self) -> None:
+        """Abre el circuito manualmente (Fase 6, Bug 2) — ver `CircuitBreaker.force_open`."""
+        await self._breaker.force_open()

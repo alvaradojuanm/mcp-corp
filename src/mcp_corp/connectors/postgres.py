@@ -17,16 +17,41 @@ aparece bajo presión real del pool, no en desarrollo. psycopg3 tiene un
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 from collections.abc import Awaitable, Callable
 from typing import Any, TypeVar
 
+import psycopg
 from psycopg import AsyncConnection
-from psycopg_pool import AsyncConnectionPool
+from psycopg_pool import AsyncConnectionPool, PoolTimeout
 
 logger = logging.getLogger(__name__)
 
 R = TypeVar("R")
+
+# Qué excepciones cuentan como fallo de infraestructura para el circuit
+# breaker de Postgres (Fase 6, Bug 2). `PoolTimeout` (lo que se levanta
+# al agotarse el pool o al no conseguir abrirlo a tiempo) NO hereda de
+# `TimeoutError`/`OSError`/`ConnectionError` de la stdlib — hereda de
+# `psycopg.OperationalError` (verificado contra el código fuente de
+# psycopg_pool, ver README). Sin este override explícito, `resilience.py`
+# usaría su tupla por defecto, que no incluye `PoolTimeout`: el breaker
+# nunca la contaría como fallo, y el error se propagaría tal cual hacia
+# `tools.py`, donde NO es un `ConnectorError` — no se traduciría al
+# mensaje de negocio limpio y podría filtrar detalle interno.
+POSTGRES_INFRA_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    OSError,
+    ConnectionError,
+    TimeoutError,
+    psycopg.OperationalError,
+)
+
+# Timeout corto y fijo para health(): un pool en modo degradado (sin
+# ninguna conexión disponible) no debe dejar /diagnostics colgado
+# esperando el timeout por defecto del pool (30s).
+_HEALTH_CHECK_TIMEOUT_SECONDS = 3.0
 
 
 class PostgresConnector:
@@ -48,23 +73,59 @@ class PostgresConnector:
         self._pool_open_timeout_seconds = pool_open_timeout_seconds
         self._pool: AsyncConnectionPool | None = None
 
-    async def connect(self) -> None:
-        """Crea y abre el pool, atado al lifespan del server.
-
-        El pool se crea con `open=False` y se abre explícitamente con
-        `await pool.open(wait=True, ...)`: abrir el pool dentro del
-        constructor está deprecado en versiones recientes de psycopg_pool
-        (emite `RuntimeWarning`) y depende de que exista un event loop
-        corriendo, que no es el caso en el momento de instanciar el objeto.
-        """
-        self._pool = AsyncConnectionPool(
+    def _new_pool(self) -> AsyncConnectionPool:
+        return AsyncConnectionPool(
             conninfo=self._dsn,
             min_size=self._min_pool_size,
             max_size=self._max_pool_size,
             open=False,
             name=self.name,
         )
-        await self._pool.open(wait=True, timeout=self._pool_open_timeout_seconds)
+
+    async def connect(self) -> None:
+        """Abre el pool. Arranca en modo degradado si Postgres no responde
+        a tiempo (Fase 6, Bug 2) — nunca deja que esto tumbe el proceso.
+
+        El pool se crea con `open=False` y se abre explícitamente con
+        `await pool.open(wait=True, ...)`: abrir el pool dentro del
+        constructor está deprecado en versiones recientes de psycopg_pool
+        (emite `RuntimeWarning`) y depende de que exista un event loop
+        corriendo, que no es el caso en el momento de instanciar el objeto.
+
+        Si `open(wait=True, timeout=X)` agota el timeout, levanta
+        `PoolTimeout` — y, según el código fuente de psycopg_pool, ese
+        mismo timeout CIERRA el pool (`wait()` llama a `close()` antes de
+        lanzar la excepción). Un pool cerrado no se puede reabrir
+        (`PoolClosed` si se intenta) — hay que descartarlo y crear uno
+        nuevo. Por eso, ante ese caso: se descarta el pool fallido y se
+        abre uno NUEVO en modo NO bloqueante (`wait=False`), que arranca
+        sus workers en background sin esperar ni lanzar nada. No hace
+        falta ningún bucle de reintento propio aquí: cada operación real
+        contra el pool (`run()`, `health()`) ya reintenta obtener una
+        conexión por su cuenta, contando como fallo de infraestructura
+        mientras la fuente siga caída (ver `POSTGRES_INFRA_EXCEPTIONS`) —
+        eso es lo que mantiene el circuit breaker abierto y lo que permite
+        que se cierre solo en cuanto Postgres vuelva a responder.
+        """
+        pool = self._new_pool()
+        try:
+            await pool.open(wait=True, timeout=self._pool_open_timeout_seconds)
+        except PoolTimeout:
+            with contextlib.suppress(Exception):
+                await pool.close()
+            logger.warning(
+                "connector_pool_degraded_start",
+                extra={
+                    "source": self.name,
+                    "detail": "Postgres no respondió a tiempo; arranca en modo degradado",
+                },
+            )
+            pool = self._new_pool()
+            await pool.open(wait=False)
+            self._pool = pool
+            return
+
+        self._pool = pool
         logger.info(
             "connector_pool_opened",
             extra={
@@ -82,12 +143,15 @@ class PostgresConnector:
             self._pool = None
 
     async def health(self) -> bool:
-        """`SELECT 1` real contra una conexión prestada del pool."""
+        """`SELECT 1` real contra una conexión prestada del pool, acotado
+        a `_HEALTH_CHECK_TIMEOUT_SECONDS` para no colgar `/diagnostics`
+        cuando el pool está en modo degradado (sin conexiones)."""
         if self._pool is None:
             return False
         try:
-            async with self._pool.connection() as conn:
-                await conn.execute("SELECT 1")
+            async with asyncio.timeout(_HEALTH_CHECK_TIMEOUT_SECONDS):
+                async with self._pool.connection() as conn:
+                    await conn.execute("SELECT 1")
             return True
         except Exception:
             logger.warning(

@@ -5,15 +5,19 @@ repositorio es la **plantilla base** que se clonará para cada fuente de datos
 concreta; por eso esta fase prioriza claridad y solidez del andamiaje sobre
 velocidad de entrega.
 
-**Estado actual: Fase 5 — artefactos de despliegue para entorno pre-productivo.**
-Fases 1 a 4 cerradas (andamiaje base, capa de conectores + Postgres,
+**Estado actual: Fase 6 — correcciones de campo.**
+Fases 1 a 5 cerradas (andamiaje base, capa de conectores + Postgres,
 conector HTTP + tools MCP + auditoría, identificadores venezolanos y
-escalado horizontal verificado bajo carga). La Fase 5 resuelve cómo correr
-todo eso en Docker Swarm de verdad: secretos montados como archivo (Swarm
-no los entrega como variables de entorno), un stack file completo con
-HTTPS y límites de recursos, manifiestos de OpenShift/Kubernetes ya
-desplegables (no un esqueleto), y el runbook operativo — ver
-[`deploy/README.md`](deploy/README.md).
+escalado horizontal verificado bajo carga, artefactos de despliegue para
+entorno pre-productivo — ver [`deploy/README.md`](deploy/README.md)). La
+Fase 6 corrige tres problemas reales encontrados en un despliegue de
+verdad: el registro de tools era todo-o-nada en vez de por-fuente (ver
+"Registro de tools por fuente disponible" abajo), el servidor moría al
+arrancar si una fuente estaba caída en vez de arrancar en modo degradado
+(ver "Arranque en modo degradado"), y las sesiones MCP no sobreviven a
+más de una réplica detrás de un balanceador sin sticky sessions (ver
+"Sesiones MCP con múltiples réplicas" — investigado y documentado, no
+implementado esta fase).
 
 ## Qué es esto
 
@@ -126,7 +130,111 @@ y el stub de saldos en
 solo para desarrollo local; no es el stack de despliegue (eso sigue siendo
 `deploy/swarm/`).
 
-## Tools, Resource y Prompt (Fases 3 y 4)
+## Registro de tools por fuente disponible (Fase 6, Bug 1)
+
+Antes de esta fase, `register_tools()` registraba las tres tools solo si
+**ambos** conectores (`postgres` y `saldo_api`) estaban en el registro —
+un residuo de cuando `resumen_cliente` era la única tool que importaba.
+En un despliegue real con Postgres sano pero `saldo_api` deshabilitado a
+propósito (ver "Recomendación: desplegar en dos etapas" en
+[`deploy/README.md`](deploy/README.md)), esto registraba **cero tools**,
+incluida `consultar_cliente`, que no necesita `saldo_api` para nada.
+
+Ahora cada tool, el Resource y el Prompt se registran si y solo si sus
+propias fuentes están disponibles:
+
+| Registrable | Requiere | Se omite si falta |
+|---|---|---|
+| `consultar_cliente` | `postgres` | `postgres` |
+| `consultar_saldo` | `saldo_api` | `saldo_api` |
+| `resumen_cliente` | `postgres` **y** `saldo_api` | cualquiera de los dos |
+| Resource `data://clientes/estados` | `postgres` | `postgres` |
+| Prompt `atencion_cliente` | `postgres` **y** `saldo_api` | cualquiera de los dos |
+
+Al arrancar, un log `tools_registration_summary` deja explícito qué se
+registró y qué se omitió y por qué:
+
+```json
+{"event": "tools_registration_summary", "registradas": ["consultar_cliente"], "omitidas": {"consultar_saldo": "requiere el conector 'saldo_api', que no está disponible", "resumen_cliente": "requiere ambos conectores; falta(n): saldo_api"}}
+```
+
+**Verificado contra el protocolo MCP real, no inspeccionando variables
+internas.** Los tests en
+[`tests/tools/test_tools_registration.py`](tests/tools/test_tools_registration.py)
+usan `fastmcp.Client(mcp).list_tools()` (y `list_resources()` /
+`list_prompts()`) contra las cuatro combinaciones posibles de conectores
+disponibles, incluyendo el caso exacto del bug en producción (Postgres
+sano, `saldo_api` deshabilitado). Este tipo de test — contra el protocolo
+tal como lo ve un cliente MCP real, no contra el estado interno del
+server — debió existir desde la Fase 3; no existía, y por eso el bug
+llegó a producción sin que la suite lo detectara.
+
+## Arranque en modo degradado (Fase 6, Bug 2)
+
+Antes de esta fase, `ConnectorRegistry.connect_all()` dejaba que
+cualquier excepción de `connector.connect()` se propagara sin atajar
+hasta el lifespan del server — si Postgres no respondía a tiempo
+(`psycopg_pool.PoolTimeout: pool initialization incomplete after 10.0
+sec`), el proceso entero moría antes de servir una sola petición. En
+Swarm/Kubernetes esto se manifiesta como un bucle de reinicio: la réplica
+nueva vuelve a fallar contra el mismo Postgres caído, se reinicia, falla
+de nuevo.
+
+Ahora **una fuente caída al arrancar nunca tumba el proceso**:
+
+- `ConnectorRegistry.connect_all()` atrapa cualquier excepción de
+  `connect()` por conector, registra `connector_startup_failed` y fuerza
+  el circuito de esa fuente a `open` (`ResilientExecutor.force_open()`,
+  nuevo) — el registro sigue con las demás fuentes.
+- El conector de Postgres tiene además su propio manejo específico: si
+  `pool.open(wait=True, timeout=...)` agota el timeout, `psycopg_pool`
+  levanta `PoolTimeout` y **cierra el pool** (no se puede reabrir). En
+  vez de propagar esa excepción, `PostgresConnector.connect()` descarta
+  ese pool y abre uno nuevo en modo no bloqueante (`wait=False`), que
+  arranca sus workers en background sin esperar ni lanzar nada — el
+  conector queda con un pool "vivo pero vacío" en vez de sin pool.
+- Las tools que dependen solo de fuentes sanas funcionan con normalidad
+  desde el primer segundo. Las que dependen de la fuente caída fallan
+  limpio con el mismo `ToolError` de negocio que ya existía para
+  cualquier circuito abierto (nunca un stack trace ni un crash).
+- **Recuperación automática, sin reiniciar el proceso.** No hace falta
+  ningún bucle de reintento propio: en cuanto una operación real contra
+  esa fuente tiene éxito, el circuit breaker ya existente (medio-abierto
+  tras `reset_timeout_seconds`, cierre tras `success_threshold` éxitos)
+  la cierra sola. Verificado tanto con tests automatizados
+  ([`tests/connectors/test_degraded_startup.py`](tests/connectors/test_degraded_startup.py),
+  [`tests/connectors/test_postgres_degraded_connect.py`](tests/connectors/test_postgres_degraded_connect.py))
+  como manualmente contra un Postgres real en Docker: arranque con
+  Postgres apagado → el proceso sigue vivo → se enciende Postgres →
+  dos llamadas reales a la tool bastan para ver el circuito volver a
+  `closed` en `/diagnostics`, sin ninguna intervención manual.
+- `PoolTimeout` no hereda de `TimeoutError`/`OSError`/`ConnectionError`
+  de la stdlib (hereda de `psycopg.OperationalError`) — sin el ajuste a
+  `POSTGRES_INFRA_EXCEPTIONS` en `main.py` (ausente antes de esta fase),
+  el circuit breaker nunca la habría contado como fallo de
+  infraestructura y el error se habría propagado sin traducir hacia
+  `tools.py`.
+
+**¿Por qué no se registran/desregistran tools dinámicamente al recuperarse una fuente?**
+Se evaluó usar `notifications/tools/list_changed` (FastMCP lo dispara al
+llamar `add_tool()` / `enable()` / `disable()` / `remove_tool()`) para
+que, por ejemplo, `resumen_cliente` apareciera recién cuando ambas
+fuentes estuvieran sanas. Se descartó por dos razones: (1) esas
+notificaciones solo se emiten dentro de un request MCP activo — un
+conector que se recupera en segundo plano (sin que haya ninguna petición
+en curso en ese instante) no tiene un contexto de request desde el cual
+disparar la notificación, así que no encaja de forma natural con una
+recuperación asíncrona; (2) con el criterio del Bug 1, una tool ya se
+registra desde el arranque si su fuente está *configurada y habilitada*,
+sin importar si en ese momento está sana — "sana" es un estado que
+cambia con el circuit breaker, no con el registro de la tool. Una tool
+cuya fuente cae simplemente empieza a fallar limpio (circuito abierto) y
+vuelve a funcionar sola en cuanto el breaker cierra, sin que haga falta
+quitarla ni volver a añadirla del catálogo. Registro dinámico queda como
+opción a reconsiderar solo si en el futuro se necesita ocultar del todo
+una tool (no solo hacerla fallar limpio) mientras su fuente está caída.
+
+
 
 Con la infraestructura de desarrollo arriba (Postgres + stub de saldos) y
 el server corriendo con ambos conectores habilitados, cualquier cliente
@@ -915,13 +1023,93 @@ una conexión del pool — es el filtro más barato posible, y en un sistema
 donde cada fuente tiene un techo de concurrencia finito, filtrar temprano
 importa.
 
+### Fase 6 — correcciones de campo
+
+**Sesiones MCP con múltiples réplicas (Bug 3): investigado, NO implementado esta fase.**
+Con una sola réplica todo funciona. Con dos o más réplicas detrás de
+Traefik sin sticky sessions, `initialize` crea la sesión en la réplica
+que atendió esa petición; la siguiente petición con ese
+`Mcp-Session-Id` puede caer en otra réplica y responder `"Session not
+found"`. Esto contradice la premisa "stateless" heredada de la Fase 1 —
+cierta para las tools (cada invocación es petición/respuesta, sin
+estado propio) pero **falsa** para el transporte: el
+`StreamableHTTPSessionManager` del SDK de MCP guarda el estado de cada
+sesión (streams SSE, tareas en curso) **en memoria del proceso que la
+creó**, sin ningún backend compartido. Es el mismo hallazgo, visto desde
+otro ángulo, que el de la Fase 4: el stream SSE se corta abruptamente
+ante SIGTERM durante una rotación de réplicas (ver "Graceful shutdown
+durante una rotación de réplicas" arriba) — en ambos casos, lo que se
+rompe es la sesión de transporte de larga duración, no una tool call.
+
+Tres opciones evaluadas, ninguna implementada:
+
+**1. Estado de sesión compartido (Redis).**
+Es la respuesta "correcta" en teoría para escalado horizontal, pero
+bloqueada hoy por la arquitectura del propio SDK de MCP: el
+`StreamableHTTPSessionManager` no tiene soporte nativo para un backend
+externo — lo que guarda por sesión no es un diccionario serializable,
+son streams SSE y tareas `asyncio` en vuelo, que no se pueden mover de
+un proceso a otro tal cual. Hay un issue abierto y sin resolver en el
+SDK oficial (`modelcontextprotocol/python-sdk#880`) pidiendo exactamente
+esto para escalado horizontal. Implementarlo hoy significaría, en la
+práctica, parchear o reescribir esa capa del SDK — alto esfuerzo, alto
+riesgo, y quedaríamos manteniendo un fork. **No recomendado mientras el
+SDK no lo soporte nativamente**; revisar de nuevo cuando ese issue (o
+uno equivalente) se resuelva upstream.
+
+**2. Sticky sessions en Traefik.**
+Traefik v2.11 soporta afinidad **por cookie** de forma nativa
+(`services.<name>.loadBalancer.sticky.cookie`) — NO por header. Afinidad
+por header (que sería lo natural aquí, pegando por `Mcp-Session-Id`) es
+un feature request abierto en Traefik (`traefik/traefik#1207`), no algo
+disponible hoy. La opción real es entonces cookie-based: existe un
+patrón documentado para exactamente este caso (router dedicado con
+`PathPrefix(/mcp)` + cookie `httpOnly`/`secure`/`sameSite=strict`).
+Riesgo real: esto depende de que el CLIENTE MCP conserve y reenvíe la
+cookie de afinidad entre peticiones de la misma sesión — cierto para un
+cliente HTTP con cookie jar (p. ej. `httpx.AsyncClient` con
+`cookies=...`, que es lo que usa `fastmcp.Client` internamente), pero no
+garantizado por el protocolo MCP en sí para cualquier implementación de
+cliente. Configuración rápida (una etiqueta de Traefik), pero: (a) no
+resuelve el corte de SSE en SIGTERM durante una rotación — una sesión
+pegada a la réplica que se está apagando se corta igual; (b) degrada el
+balanceo real, porque una réplica con muchas sesiones largas pegadas
+acumula carga desproporcionada frente a una réplica nueva sin sesiones.
+
+**3. Delegar en el futuro gateway de gobierno.**
+Si el gateway (Fase 7+) es el componente que habla MCP contra este
+server — en vez de que cada cliente final lo haga directamente — el
+problema no desaparece, pero se **concentra en un solo lugar que
+controlamos** en vez de exigir que cada cliente MCP (actual y futuro)
+implemente su propia lógica de reconexión ante `"Session not found"`.
+Un gateway que ya sabe reintentar `initialize` de forma transparente
+cuando pierde una sesión resuelve esto una vez, con conocimiento
+completo de cuándo está pasando (rotación de réplica, sesión perdida),
+en vez de que N clientes distintos tengan que adivinarlo por su cuenta.
+Sigue sin arreglar el corte de SSE en sí — el gateway también perdería
+su sesión si su réplica destino rota — pero mover el trabajo de "cómo
+recuperarse de esto" a una sola pieza de infraestructura, en vez de a
+cada consumidor, es lo que hace esta opción atractiva en costo total.
+
+**Recomendación:** opción 3 como dirección de fondo (ya está en el plan
+de fases futuras, así que no es trabajo adicional, es orden de
+prioridad), con la opción 2 (sticky por cookie) como mitigación de corto
+plazo si hace falta escalar a más de una réplica ANTES de que el gateway
+exista — aceptando sus dos limitaciones (no soluciona el corte por
+SIGTERM, degrada el balanceo). La opción 1 (Redis) queda descartada por
+ahora, no por preferencia sino porque el SDK de MCP no la soporta
+todavía sin intervención mayor sobre su código interno.
+
 ## Próximas fases (fuera de alcance aquí)
 
-- Fase 6+: gateway de gobierno, más tools de negocio, más conectores
-  (sistemas legacy) sobre el mismo protocolo `Connector` / `ResilientExecutor`.
-- Desplegar de verdad `deploy/swarm/mcp-corp-stack.yml` en un Swarm real y
-  completar los `TODO` (dominio, red interna de Postgres, URL de la API
-  de saldos real) — quedó listo para eso pero no ejecutado en este entorno.
+- Fase 7+: gateway de gobierno (candidato natural para resolver Bug 3 de
+  la Fase 6, ver "Sesiones MCP con múltiples réplicas" arriba), más tools
+  de negocio, más conectores (sistemas legacy) sobre el mismo protocolo
+  `Connector` / `ResilientExecutor`.
+- Desplegar `deploy/swarm/mcp-corp-stack.yml` en más de una réplica en el
+  entorno pre-productivo real y decidir si hace falta sticky sessions
+  (opción 2 de "Sesiones MCP con múltiples réplicas") antes de que exista
+  el gateway.
 - Token bucket para límite de tasa (req/s) por fuente — hoy solo hay
   límite de concurrencia (ver `rate_limit_per_second` en `config.py`).
 - Estado del circuit breaker compartido entre réplicas (hoy es por

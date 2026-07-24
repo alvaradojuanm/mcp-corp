@@ -224,12 +224,16 @@ def register_tools(
     identifiers_prefijos: frozenset[str] = PREFIJOS_BASE,
     identifiers_validar_checksum: bool = True,
 ) -> None:
-    """Registra las tres tools de negocio, si sus conectores existen.
+    """Registra cada tool de negocio SI Y SOLO SI sus propias fuentes existen.
 
-    Si Postgres o la API de saldos no están habilitados en esta réplica
-    (`settings.postgres.enabled` / `settings.saldo_api.enabled`), no
-    registra tools en vez de fallar: un server sin ambas fuentes no puede
-    ofrecer estas tools con sentido.
+    Fase 6 (Bug 1): antes, el registro era todo-o-nada — con Postgres sano
+    pero `saldo_api` deshabilitada, el server no exponía NI SIQUIERA
+    `consultar_cliente`, que no depende de `saldo_api` en absoluto. Cada
+    tool ahora se registra de forma independiente según qué conectores
+    tiene disponibles en el `registry`:
+      - `consultar_cliente` requiere solo `postgres`.
+      - `consultar_saldo` requiere solo `saldo_api`.
+      - `resumen_cliente` requiere AMBOS (orquesta las dos fuentes).
 
     `audit_hmac_secret`: clave del HMAC usado por `audit.audited_tool` para
     enmascarar el identificador en el log (ver `Settings.audit_hmac_secret`).
@@ -237,78 +241,103 @@ def register_tools(
     `identifiers_prefijos` / `identifiers_validar_checksum`: vienen de
     `Settings.identifiers` (ver `identifiers.py` y `config.py`).
     """
-    if "postgres" not in registry or "saldo_api" not in registry:
-        logger.warning(
-            "tools_not_registered_missing_connectors",
-            extra={
-                "postgres_registrado": "postgres" in registry,
-                "saldo_api_registrado": "saldo_api" in registry,
-            },
+    postgres_disponible = "postgres" in registry
+    saldo_disponible = "saldo_api" in registry
+
+    registradas: list[str] = []
+    omitidas: dict[str, str] = {}
+
+    if postgres_disponible:
+        postgres_executor = registry.get("postgres").executor
+
+        @mcp.tool
+        @audited_tool("consultar_cliente", identifier_param="identificador", secret=audit_hmac_secret)
+        async def consultar_cliente(identificador: Identificador) -> dict[str, Any]:
+            """Consulta los datos de identidad de un cliente por cédula o RIF (fuente: PostgreSQL).
+
+            Devuelve nombre, email y estado del cliente. Úsala cuando necesites SOLO esos datos, sin
+            el saldo. Si también necesitas el saldo, usa `resumen_cliente` en su lugar: es una sola
+            llamada en vez de dos, y consulta ambas fuentes en paralelo.
+            """
+            return await _consultar_cliente_logic(
+                identificador,
+                postgres_executor,
+                prefijos=identifiers_prefijos,
+                validar_checksum=identifiers_validar_checksum,
+            )
+
+        registradas.append("consultar_cliente")
+    else:
+        omitidas["consultar_cliente"] = "requiere el conector 'postgres', que no está disponible"
+
+    if saldo_disponible:
+        saldo_executor = registry.get("saldo_api").executor
+
+        @mcp.tool
+        @audited_tool("consultar_saldo", identifier_param="identificador", secret=audit_hmac_secret)
+        async def consultar_saldo(identificador: Identificador) -> dict[str, Any]:
+            """Consulta el saldo actual de un cliente por cédula o RIF (fuente: API REST de saldos).
+
+            Devuelve el saldo y su moneda. Úsala cuando necesites SOLO el saldo, sin los datos de
+            identidad del cliente. Si también necesitas esos datos, usa `resumen_cliente` en su lugar.
+            """
+            return await _consultar_saldo_logic(
+                identificador,
+                saldo_executor,
+                prefijos=identifiers_prefijos,
+                validar_checksum=identifiers_validar_checksum,
+            )
+
+        registradas.append("consultar_saldo")
+    else:
+        omitidas["consultar_saldo"] = "requiere el conector 'saldo_api', que no está disponible"
+
+    if postgres_disponible and saldo_disponible:
+        postgres_executor = registry.get("postgres").executor
+        saldo_executor = registry.get("saldo_api").executor
+
+        @mcp.tool
+        @audited_tool(
+            "resumen_cliente",
+            identifier_param="identificador",
+            secret=audit_hmac_secret,
+            outcome_of=lambda result: "success" if result["resumen_completo"] else "partial",
         )
-        return
+        async def resumen_cliente(identificador: Identificador) -> dict[str, Any]:
+            """Obtiene, en una sola llamada, los datos de identidad Y el saldo de un cliente por cédula o RIF.
 
-    postgres_executor = registry.get("postgres").executor
-    saldo_executor = registry.get("saldo_api").executor
+            Consulta en paralelo la base de clientes (PostgreSQL) y el servicio de saldos (API REST).
+            Es la tool preferida para una visión completa del cliente: úsala en vez de llamar
+            `consultar_cliente` y `consultar_saldo` por separado.
 
-    @mcp.tool
-    @audited_tool("consultar_cliente", identifier_param="identificador", secret=audit_hmac_secret)
-    async def consultar_cliente(identificador: Identificador) -> dict[str, Any]:
-        """Consulta los datos de identidad de un cliente por cédula o RIF (fuente: PostgreSQL).
+            El resultado puede venir PARCIAL: si una de las dos fuentes no está disponible ahora
+            mismo, esta tool NO falla — devuelve lo que sí pudo obtener y marca explícitamente, en
+            `cliente.disponible` / `saldo.disponible` (con su `motivo`), qué parte falta y por qué.
+            Un dato ausente NUNCA es cero ni un valor válido: revisa siempre los campos `disponible`
+            antes de usar `cliente.datos` o `saldo.datos`; si alguno es `false`, dile al usuario cuál
+            parte no está disponible en vez de inventarla, asumirla en cero o callarla.
+            """
+            return await _resumen_cliente_logic(
+                identificador,
+                postgres_executor,
+                saldo_executor,
+                prefijos=identifiers_prefijos,
+                validar_checksum=identifiers_validar_checksum,
+            )
 
-        Devuelve nombre, email y estado del cliente. Úsala cuando necesites SOLO esos datos, sin
-        el saldo. Si también necesitas el saldo, usa `resumen_cliente` en su lugar: es una sola
-        llamada en vez de dos, y consulta ambas fuentes en paralelo.
-        """
-        return await _consultar_cliente_logic(
-            identificador,
-            postgres_executor,
-            prefijos=identifiers_prefijos,
-            validar_checksum=identifiers_validar_checksum,
-        )
+        registradas.append("resumen_cliente")
+    else:
+        faltantes = [
+            nombre
+            for nombre, disponible in (("postgres", postgres_disponible), ("saldo_api", saldo_disponible))
+            if not disponible
+        ]
+        omitidas["resumen_cliente"] = f"requiere ambos conectores; falta(n): {', '.join(faltantes)}"
 
-    @mcp.tool
-    @audited_tool("consultar_saldo", identifier_param="identificador", secret=audit_hmac_secret)
-    async def consultar_saldo(identificador: Identificador) -> dict[str, Any]:
-        """Consulta el saldo actual de un cliente por cédula o RIF (fuente: API REST de saldos).
-
-        Devuelve el saldo y su moneda. Úsala cuando necesites SOLO el saldo, sin los datos de
-        identidad del cliente. Si también necesitas esos datos, usa `resumen_cliente` en su lugar.
-        """
-        return await _consultar_saldo_logic(
-            identificador,
-            saldo_executor,
-            prefijos=identifiers_prefijos,
-            validar_checksum=identifiers_validar_checksum,
-        )
-
-    @mcp.tool
-    @audited_tool(
-        "resumen_cliente",
-        identifier_param="identificador",
-        secret=audit_hmac_secret,
-        outcome_of=lambda result: "success" if result["resumen_completo"] else "partial",
+    logger.info(
+        "tools_registration_summary",
+        extra={"registradas": registradas, "omitidas": omitidas},
     )
-    async def resumen_cliente(identificador: Identificador) -> dict[str, Any]:
-        """Obtiene, en una sola llamada, los datos de identidad Y el saldo de un cliente por cédula o RIF.
-
-        Consulta en paralelo la base de clientes (PostgreSQL) y el servicio de saldos (API REST).
-        Es la tool preferida para una visión completa del cliente: úsala en vez de llamar
-        `consultar_cliente` y `consultar_saldo` por separado.
-
-        El resultado puede venir PARCIAL: si una de las dos fuentes no está disponible ahora
-        mismo, esta tool NO falla — devuelve lo que sí pudo obtener y marca explícitamente, en
-        `cliente.disponible` / `saldo.disponible` (con su `motivo`), qué parte falta y por qué.
-        Un dato ausente NUNCA es cero ni un valor válido: revisa siempre los campos `disponible`
-        antes de usar `cliente.datos` o `saldo.datos`; si alguno es `false`, dile al usuario cuál
-        parte no está disponible en vez de inventarla, asumirla en cero o callarla.
-        """
-        return await _resumen_cliente_logic(
-            identificador,
-            postgres_executor,
-            saldo_executor,
-            prefijos=identifiers_prefijos,
-            validar_checksum=identifiers_validar_checksum,
-        )
 
 
 # --- Resource: catálogo de estados de cliente ---------------------------
@@ -320,7 +349,7 @@ ESTADOS_CLIENTE: dict[str, str] = {
 }
 
 
-def register_resources(mcp: FastMCP) -> None:
+def register_resources(mcp: FastMCP, registry: ConnectorRegistry) -> None:
     """Registra el catálogo de estados como Resource de solo lectura.
 
     Diferencia con una Tool: esto es contexto que la aplicación cliente
@@ -328,7 +357,17 @@ def register_resources(mcp: FastMCP) -> None:
     mostrarlo en una UI o para que el modelo lo tenga disponible sin gastar
     un turno de tool-call. Una Tool es una acción que el modelo elige
     ejecutar; un Resource es un dato que ya está ahí.
+
+    Mismo criterio del Bug 1 (Fase 6): el catálogo describe el campo
+    `estado` de `clientes`, una tabla de Postgres — solo tiene sentido
+    ofrecerlo si el conector `postgres` está disponible.
     """
+    if "postgres" not in registry:
+        logger.info(
+            "resource_not_registered",
+            extra={"resource": "data://clientes/estados", "motivo": "requiere el conector 'postgres'"},
+        )
+        return
 
     @mcp.resource(
         "data://clientes/estados",
@@ -346,7 +385,21 @@ def register_resources(mcp: FastMCP) -> None:
 # --- Prompt: flujo de atención al cliente -------------------------------
 
 
-def register_prompts(mcp: FastMCP) -> None:
+def register_prompts(mcp: FastMCP, registry: ConnectorRegistry) -> None:
+    """Registra el prompt de flujo de atención al cliente.
+
+    Mismo criterio del Bug 1 (Fase 6): el prompt le indica al modelo usar
+    `resumen_cliente` como primer paso, así que solo tiene sentido
+    ofrecerlo cuando ambos conectores (`postgres` y `saldo_api`) están
+    disponibles — igual que `resumen_cliente` misma.
+    """
+    if not ("postgres" in registry and "saldo_api" in registry):
+        logger.info(
+            "prompt_not_registered",
+            extra={"prompt": "atencion_cliente", "motivo": "requiere ambos conectores (postgres y saldo_api)"},
+        )
+        return
+
     @mcp.prompt
     def atencion_cliente(identificador: Identificador) -> str:
         """Flujo de atención al cliente por cédula/RIF: qué tool usar y cómo manejar datos parciales.

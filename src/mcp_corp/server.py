@@ -99,8 +99,8 @@ def create_server(settings: Settings, registry: ConnectorRegistry | None = None)
         identifiers_prefijos=prefijos_habilitados(incluir_c=settings.identifiers.incluir_prefijo_c),
         identifiers_validar_checksum=settings.identifiers.validar_digito_verificador,
     )
-    register_resources(mcp)
-    register_prompts(mcp)
+    register_resources(mcp, connector_registry)
+    register_prompts(mcp, connector_registry)
 
     @mcp.custom_route("/health", methods=["GET"])
     async def health(_request: Request) -> JSONResponse:

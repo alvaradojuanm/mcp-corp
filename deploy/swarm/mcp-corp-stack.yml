@@ -40,21 +40,11 @@
 #    corriendo como edge router (patrón estándar de Portainer). Si no
 #    existe: `docker network create --driver overlay --attachable traefik_public`.
 #
-# 4) RED PARA ALCANZAR POSTGRES — TODO: `TODO_postgres_network` (abajo, en
-#    `networks:` y en el bloque `networks:` del servicio) es un
-#    placeholder que **no existe** — Swarm rechaza desplegar un stack que
-#    referencia una red `external: true` inexistente. Dos caminos:
-#      a) Postgres corre como servicio en ESTE MISMO swarm en una red que
-#         YA existe (p. ej. la de otro stack, tipo "agent_network") →
-#         cambia el nombre del placeholder por ese, en las dos líneas
-#         donde aparece.
-#      b) No existe ninguna red compartida todavía → créala primero:
-#         `docker network create --driver overlay TODO_postgres_network`
-#         (sin `--attachable` si no hace falta acceso externo).
-#    Si Postgres es una instancia fuera del swarm (RDS, un host aparte)
-#    alcanzable directamente por IP/DNS público, puede que no haga falta
-#    ninguna red dedicada — en ese caso elimina `TODO_postgres_network` de
-#    ambos bloques `networks:`.
+# 4) RED PARA ALCANZAR POSTGRES — resuelto: `agent_network`, la red
+#    overlay externa que ya existe en este Portainer (confirmada junto a
+#    "traefik_public" en Networks). Asumimos que Postgres es alcanzable
+#    desde ahí (p. ej. corre en un stack — como "timelinex" — conectado a
+#    esa misma red). Si no fuera así, ajusta esto.
 #
 # 5) DOMINIO DEL ROUTER DE TRAEFIK — TODO: reemplaza
 #    `TODO-mcp-corp.example.com` por el dominio real antes de desplegar.
@@ -147,7 +137,7 @@ services:
         target: postgres_dsn
     networks:
       - traefik_public
-      - TODO_postgres_network
+      - agent_network
     healthcheck:
       # Mismo mecanismo que el HEALTHCHECK del Dockerfile: la imagen base
       # (python:3.12-slim) NO trae curl ni wget, así que se usa el propio
@@ -224,10 +214,9 @@ services:
 networks:
   traefik_public:
     external: true
-  # TODO: nombre real de la red que alcanza Postgres (ver prerrequisito 4).
-  # NO existe con este nombre — Swarm rechazará el despliegue hasta que la
-  # crees o renombres esto para que coincida con una red ya existente.
-  TODO_postgres_network:
+  # Red que alcanza Postgres — ya existe en este Portainer (ver
+  # prerrequisito 4).
+  agent_network:
     external: true
 
 secrets:

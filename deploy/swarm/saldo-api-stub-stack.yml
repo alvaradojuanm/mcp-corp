@@ -12,9 +12,8 @@
 #
 # Luego, en mcp-corp-stack.yml, apunta:
 #   MCP_CORP_SALDO_API__BASE_URL: "http://saldo-api-stub:8080"
-# (el nombre "saldo-api-stub" resuelve por DNS de Swarm si ambos stacks
-# comparten la red `TODO_postgres_network` — o la red interna que hayas usado;
-# renómbrala aquí igual que en mcp-corp-stack.yml para que compartan red).
+# (el nombre "saldo-api-stub" resuelve por DNS de Swarm porque ambos
+# stacks comparten la red `agent_network`, ya existente en este Portainer).
 
 version: "3.8"
 
@@ -32,7 +31,7 @@ services:
         target: /app/saldo_api_stub.py
         read_only: true
     networks:
-      - TODO_postgres_network # TODO: misma red interna que usa mcp-corp-stack.yml
+      - agent_network
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2)"]
       interval: 10s
@@ -59,5 +58,5 @@ services:
           memory: 64M
 
 networks:
-  TODO_postgres_network:
+  agent_network:
     external: true

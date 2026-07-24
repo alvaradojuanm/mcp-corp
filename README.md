@@ -458,6 +458,44 @@ cargadas con `pydantic-settings` en [`src/mcp_corp/config.py`](src/mcp_corp/conf
 Ver [`.env.example`](.env.example) para la lista completa con valores de
 ejemplo. **Nunca** commitees un `.env` real: está excluido en `.gitignore`.
 
+### Secretos como archivo (Docker Swarm / Kubernetes, Fase 5)
+
+Docker Swarm monta cada secreto como un ARCHIVO en `/run/secrets/<nombre>`,
+no como variable de entorno — y pydantic-settings solo sabe leer variables
+de entorno. `config.py` resuelve esto con el patrón `<VAR>_FILE` (el mismo
+que usan las imágenes oficiales de Postgres/MySQL/Redis en Docker Hub):
+
+```bash
+# En vez de exportar el valor directamente...
+export MCP_CORP_AUDIT_HMAC_SECRET_FILE=/run/secrets/audit_hmac_secret
+export MCP_CORP_POSTGRES__DSN_FILE=/run/secrets/postgres_dsn
+```
+
+Al arrancar, `get_settings()` lee cada archivo referenciado por una
+variable `MCP_CORP_*_FILE` y su contenido (recortado) pasa a ocupar la
+variable sin el sufijo — `MCP_CORP_AUDIT_HMAC_SECRET_FILE=/run/secrets/x`
+termina resolviendo `MCP_CORP_AUDIT_HMAC_SECRET` como si se hubiera
+exportado directamente. Funciona igual para CUALQUIER variable con
+prefijo `MCP_CORP_`, incluidas las anidadas (`MCP_CORP_POSTGRES__DSN_FILE`)
+— no hace falta enumerar cuáles son sensibles ni tocar el código cuando se
+agregue una nueva.
+
+**Precedencia** (de mayor a menor): variable de entorno real explícita >
+archivo referenciado por `_FILE` > `.env` de desarrollo > default del
+campo. Si `MCP_CORP_X` ya existe como variable real, la variante `_FILE`
+se ignora en silencio — por eso el flujo de desarrollo local con `.env`
+sigue funcionando exactamente igual que antes de esta fase, sin ningún
+cambio.
+
+**¿Por qué este patrón y no `secrets_dir` nativo de pydantic-settings?**
+Ver el docstring de `_load_file_secrets_into_environ` en `config.py` para
+el detalle: `secrets_dir` resuelve nombres de archivo a partir del nombre
+de cada campo, y su comportamiento con modelos anidados (`postgres.dsn`,
+`saldo_api.*`) no está bien cubierto en la documentación. El patrón
+`_FILE` opera sobre el nombre de la variable de entorno ya resuelta por
+pydantic-settings (prefijo + delimitador `__` incluidos), así que cubre
+cualquier campo, anidado o no, sin depender de ese comportamiento interno.
+
 ## Estructura del proyecto
 
 ```

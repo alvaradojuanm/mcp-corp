@@ -3,12 +3,74 @@
 Sigue el principio 12-factor de "config en el entorno": no hay valores de
 configuración hardcodeados en el código ni archivos de config locales; todo
 se puede sobreescribir vía variables de entorno (o un `.env` en desarrollo).
+
+**Secretos de Docker Swarm / Kubernetes (Fase 5).** Swarm monta cada
+secreto como un ARCHIVO en `/run/secrets/<nombre>`, no como variable de
+entorno — y pydantic-settings solo sabe leer variables de entorno. Se
+resuelve con el patrón `<VAR>_FILE` (el mismo que usan las imágenes
+oficiales de Postgres/MySQL/Redis en Docker Hub): si existe
+`MCP_CORP_AUDIT_HMAC_SECRET_FILE=/run/secrets/audit_hmac_secret`, su
+contenido se vuelca a `MCP_CORP_AUDIT_HMAC_SECRET` antes de construir
+`Settings` (ver `_load_file_secrets_into_environ`).
+
+**¿Por qué `_FILE` y no `secrets_dir` de pydantic-settings?**
+pydantic-settings sí trae soporte nativo (`SettingsConfigDict(secrets_dir=...)`),
+pero resuelve los nombres de archivo esperados a partir del nombre de cada
+CAMPO, y su comportamiento documentado para modelos anidados con
+`env_nested_delimiter` (nuestro caso: `postgres.dsn`, `saldo_api.*`) no es
+consistente ni está bien cubierto en la documentación — habría que
+adivinar o probar caso por caso qué nombre de archivo espera para cada
+campo anidado. El patrón `_FILE` opera sobre el NOMBRE DE LA VARIABLE DE
+ENTORNO tal cual pydantic-settings ya la resuelve (incluyendo el prefijo
+`MCP_CORP_` y el delimitador `__`), así que cubre automáticamente
+CUALQUIER variable, anidada o no, presente o futura, sin tener que
+enumerar cuáles son sensibles ni conocer los detalles internos de
+resolución de pydantic-settings. Es exactamente el mismo mecanismo que ya
+resolvimos a mano en decenas de imágenes Docker de terceros — predecible,
+fácil de auditar, y trivial de probar de forma aislada (ver
+`tests/test_config.py`).
 """
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_ENV_PREFIX = "MCP_CORP_"
+_FILE_SUFFIX = "_FILE"
+
+
+def _load_file_secrets_into_environ(environ: "os._Environ[str] | dict[str, str]" = os.environ) -> None:
+    """Resuelve `MCP_CORP_*_FILE` leyendo el archivo que apuntan, en `environ`.
+
+    Para cada `MCP_CORP_X_FILE=/ruta/al/secreto` presente, deja
+    `MCP_CORP_X=<contenido del archivo, sin espacios/saltos de línea al
+    borde>` en `environ`, ÚNICAMENTE si `MCP_CORP_X` no existe ya.
+
+    Precedencia resultante (de mayor a menor): variable de entorno real
+    explícita > archivo referenciado por `_FILE` > `.env` de desarrollo >
+    default del campo. Así, si `MCP_CORP_X` ya viene seteada (p. ej. desde
+    un `.env` cargado por pydantic-settings más tarde, o exportada a mano),
+    la variante `_FILE` se ignora en silencio — el flujo de desarrollo
+    local con `.env` sigue funcionando exactamente igual que antes de esta
+    fase.
+
+    Recibe `environ` como parámetro (por defecto `os.environ`) para poder
+    probarse sin depender de mutar el entorno real del proceso de test.
+    """
+    for key, file_path in list(environ.items()):
+        if not key.startswith(_ENV_PREFIX) or not key.endswith(_FILE_SUFFIX):
+            continue
+        target_key = key[: -len(_FILE_SUFFIX)]
+        if target_key in environ:
+            continue  # variable real explícita gana, ver docstring
+        try:
+            environ[target_key] = Path(file_path).read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise RuntimeError(f"{key} apunta a '{file_path}' pero no se pudo leer: {exc}") from exc
 
 
 class IdentifiersSettings(BaseModel):
@@ -252,7 +314,13 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """Construye la configuración desde el entorno.
 
+    Antes de construir `Settings`, resuelve cualquier secreto montado como
+    archivo (`MCP_CORP_*_FILE`, ver `_load_file_secrets_into_environ`) —
+    necesario para correr bajo Docker Swarm/Kubernetes, donde los secretos
+    llegan como archivos, no como variables de entorno.
+
     No se cachea a nivel de módulo a propósito: mantiene la función libre de
     estado oculto y trivial de testear con distintos entornos.
     """
+    _load_file_secrets_into_environ()
     return Settings()

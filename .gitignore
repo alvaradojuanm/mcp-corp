@@ -6,6 +6,11 @@
 *.key
 secrets/
 
+# Imagen exportada con `docker save` para transporte sin registro (Fase 5,
+# ver deploy/README.md) — nunca debe ir al repo, son cientos de MB.
+*.tar
+.tmp-mcp-corp*
+
 # Python
 __pycache__/
 *.py[cod]

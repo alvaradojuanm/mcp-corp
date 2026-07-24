@@ -40,15 +40,21 @@
 #    corriendo como edge router (patrón estándar de Portainer). Si no
 #    existe: `docker network create --driver overlay --attachable traefik_public`.
 #
-# 4) RED INTERNA PARA ALCANZAR POSTGRES — TODO: nombra aquí la red real.
-#    Si Postgres corre COMO SERVICIO en este mismo swarm, es otra red
-#    overlay (interna, sin `attachable` si no hace falta acceso externo).
-#    Si Postgres es una instancia externa al swarm (RDS, un host aparte),
-#    puede que no haga falta una red dedicada — depende de cómo resuelva
-#    el DNS/IP el DSN del secreto `mcp_corp_postgres_dsn`. Ajusta la
-#    sección `networks:` de abajo y el bloque `networks:` del servicio
-#    según corresponda; tal como está, el placeholder se llama
-#    `postgres_internal` y NO existe todavía.
+# 4) RED PARA ALCANZAR POSTGRES — TODO: `TODO_postgres_network` (abajo, en
+#    `networks:` y en el bloque `networks:` del servicio) es un
+#    placeholder que **no existe** — Swarm rechaza desplegar un stack que
+#    referencia una red `external: true` inexistente. Dos caminos:
+#      a) Postgres corre como servicio en ESTE MISMO swarm en una red que
+#         YA existe (p. ej. la de otro stack, tipo "agent_network") →
+#         cambia el nombre del placeholder por ese, en las dos líneas
+#         donde aparece.
+#      b) No existe ninguna red compartida todavía → créala primero:
+#         `docker network create --driver overlay TODO_postgres_network`
+#         (sin `--attachable` si no hace falta acceso externo).
+#    Si Postgres es una instancia fuera del swarm (RDS, un host aparte)
+#    alcanzable directamente por IP/DNS público, puede que no haga falta
+#    ninguna red dedicada — en ese caso elimina `TODO_postgres_network` de
+#    ambos bloques `networks:`.
 #
 # 5) DOMINIO DEL ROUTER DE TRAEFIK — TODO: reemplaza
 #    `TODO-mcp-corp.example.com` por el dominio real antes de desplegar.
@@ -59,7 +65,18 @@
 #    levantar el STUB de desarrollo para demostrar la tool compuesta de
 #    punta a punta (nunca en producción real), ver
 #    deploy/swarm/saldo-api-stub-stack.yml y apunta esta URL al servicio
-#    de ese stack.
+#    de ese stack. Hasta que la tengas resuelta, el stack arranca con
+#    `MCP_CORP_SALDO_API__ENABLED: "false"` — ver el punto siguiente.
+#
+# 7) DESPLIEGA EN DOS PASOS, no actives todo de una (ver deploy/README.md
+#    para el detalle). Primero, con `MCP_CORP_SALDO_API__ENABLED: "false"`
+#    (el valor de arranque de este archivo), confirma que Postgres solo ya
+#    funciona: réplicas `Running`, `/health` y `/ready` en 200,
+#    `/diagnostics` con el conector postgres `healthy: true`. Recién
+#    entonces resuelve el TODO de arriba y cambia
+#    `MCP_CORP_SALDO_API__ENABLED` a `"true"`. Si arrancas con las dos
+#    fuentes a la vez y algo falla, no sabes de cuál lado está — y hoy la
+#    URL de saldos es un placeholder que de todas formas no respondería.
 #
 # ═══════════════════════════════════════════════════════════════════════
 # FÓRMULA DE CAPACIDAD — reajusta cada vez que cambies `deploy.replicas`
@@ -117,8 +134,10 @@ services:
       MCP_CORP_POSTGRES__MAX_POOL_SIZE: "10"
       MCP_CORP_POSTGRES__MAX_CONCURRENCY: "10"
 
-      # TODO: URL real del servicio de saldos (ver prerrequisito 6 arriba).
-      MCP_CORP_SALDO_API__ENABLED: "true"
+      # Arranca deshabilitado a propósito — despliega en dos pasos (ver
+      # prerrequisito 7 arriba). TODO: cuando resuelvas la URL real del
+      # servicio de saldos, cambia esto a "true" y completa BASE_URL.
+      MCP_CORP_SALDO_API__ENABLED: "false"
       MCP_CORP_SALDO_API__BASE_URL: "http://TODO-saldo-api.example.internal:8080"
       MCP_CORP_SALDO_API__MAX_CONCURRENCY: "10"
     secrets:
@@ -128,11 +147,15 @@ services:
         target: postgres_dsn
     networks:
       - traefik_public
-      - postgres_internal
+      - TODO_postgres_network
     healthcheck:
       # Mismo mecanismo que el HEALTHCHECK del Dockerfile: la imagen base
       # (python:3.12-slim) NO trae curl ni wget, así que se usa el propio
-      # intérprete de Python con urllib (stdlib, siempre disponible).
+      # intérprete de Python con urllib (stdlib, siempre disponible). Este
+      # es el healthcheck de DOCKER (liveness): a propósito sigue siendo
+      # /health, no /ready — es Swarm decidiendo si reinicia el contenedor
+      # por estar colgado, no Traefik decidiendo si le manda tráfico (ese
+      # es el healthcheck de Traefik, más abajo, y ese SÍ debe ser /ready).
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
       interval: 10s
       timeout: 3s
@@ -156,12 +179,16 @@ services:
         order: start-first
         failure_action: rollback
       resources:
+        # 512M de límite: 256M quedaba apretado (Python + psycopg con pool
+        # de 10 + httpx pueden rozarlo) — si el contenedor se pasa, Swarm
+        # lo mata (OOM) y entra en bucle de reinicio sin mensaje claro.
+        # Mide con `docker stats` bajo carga real antes de recortar.
         limits:
           cpus: "0.5"
-          memory: 256M
+          memory: 512M
         reservations:
           cpus: "0.1"
-          memory: 128M
+          memory: 256M
       labels:
         - "traefik.enable=true"
         - "traefik.docker.network=traefik_public"
@@ -177,17 +204,30 @@ services:
         - "traefik.http.routers.mcp-corp-http.entrypoints=web"
         - "traefik.http.routers.mcp-corp-http.middlewares=mcp-corp-https-redirect"
         - "traefik.http.middlewares.mcp-corp-https-redirect.redirectscheme.scheme=https"
+        - "traefik.http.middlewares.mcp-corp-https-redirect.redirectscheme.permanent=true"
 
         # Balanceo entre réplicas + healthcheck activo de Traefik.
+        #
+        # ⚠️ ESTE healthcheck decide a qué réplicas Traefik les manda
+        # tráfico — es semántica de READINESS, no de liveness, así que
+        # apunta a /ready, NUNCA a /health. Con /health aquí, durante un
+        # apagado Traefik seguiría enrutando a una réplica que ya está
+        # drenando (/ready cae a 503 antes de que el proceso muera, pero
+        # /health sigue en 200 hasta el final) — justo lo que las sondas
+        # separadas de la Fase 1 existen para evitar, y lo que hace que el
+        # rolling update limpio medido en la Fase 4 (470/470 tool-calls
+        # completadas) deje de sostenerse en producción real.
         - "traefik.http.services.mcp-corp.loadbalancer.server.port=8000"
-        - "traefik.http.services.mcp-corp.loadbalancer.healthcheck.path=/health"
+        - "traefik.http.services.mcp-corp.loadbalancer.healthcheck.path=/ready"
         - "traefik.http.services.mcp-corp.loadbalancer.healthcheck.interval=10s"
 
 networks:
   traefik_public:
     external: true
   # TODO: nombre real de la red que alcanza Postgres (ver prerrequisito 4).
-  postgres_internal:
+  # NO existe con este nombre — Swarm rechazará el despliegue hasta que la
+  # crees o renombres esto para que coincida con una red ya existente.
+  TODO_postgres_network:
     external: true
 
 secrets:

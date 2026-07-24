@@ -67,7 +67,15 @@ puede editar un secreto existente in-place.
 > Rotar `mcp_corp_audit_hmac_secret` rompe la correlación histórica del
 > log de auditoría a propósito — comportamiento esperado, ver Fase 3.
 
-## 3. Despliegue del stack y qué verificar después
+## 3. Despliegue del stack — EN DOS PASOS, no todo de una
+
+`mcp-corp-stack.yml` arranca con `MCP_CORP_SALDO_API__ENABLED: "false"`
+a propósito. Si activas Postgres y la API de saldos al mismo tiempo y
+algo falla, no sabes de cuál lado está — y la URL de saldos hoy es un
+placeholder que de todas formas no respondería. Verifica un lado antes de
+prender el otro.
+
+**Paso 3a — Postgres solo:**
 
 ```bash
 docker stack deploy -c deploy/swarm/mcp-corp-stack.yml mcp-corp
@@ -76,8 +84,8 @@ docker stack deploy -c deploy/swarm/mcp-corp-stack.yml mcp-corp
 O desde Portainer: **Stacks → Add stack → Upload**, sube
 `deploy/swarm/mcp-corp-stack.yml`.
 
-**Verificación post-despliegue** (dale unos segundos a que las réplicas
-arranquen y pasen el `start_period` del healthcheck):
+**Verificación** (dale unos segundos a que las réplicas arranquen y pasen
+el `start_period` del healthcheck):
 
 ```bash
 # 1. Las réplicas están Running, no Pending ni Restarting.
@@ -89,13 +97,24 @@ curl -i https://TODO-mcp-corp.example.com/health
 # 3. /ready responde (readiness: terminó de arrancar, no se está apagando).
 curl -i https://TODO-mcp-corp.example.com/ready
 
-# 4. /diagnostics muestra el conector Postgres sano (circuit_state:
-#    "closed", healthy: true) — y el de saldo_api si lo habilitaste.
+# 4. /diagnostics muestra el conector Postgres sano
+#    (circuit_state: "closed", healthy: true). saldo_api todavía no
+#    debe aparecer — sigue deshabilitado.
 curl -s https://TODO-mcp-corp.example.com/diagnostics | jq
 ```
 
 Si el paso 1 falla (réplicas no llegan a `Running`) o el 2 falla (ni
 siquiera `/health` responde), ver "Troubleshooting" abajo antes de seguir.
+
+**Paso 3b — activar la API de saldos**, solo después de que 3a esté sano:
+
+1. Resuelve el TODO de `MCP_CORP_SALDO_API__BASE_URL` en
+   `mcp-corp-stack.yml` con la URL real (o la del stub, ver
+   `saldo-api-stub-stack.yml`, si es solo para demo).
+2. Cambia `MCP_CORP_SALDO_API__ENABLED` a `"true"`.
+3. Vuelve a desplegar: `docker stack deploy -c deploy/swarm/mcp-corp-stack.yml mcp-corp`.
+4. Repite la verificación del punto 4 de arriba — ahora `/diagnostics`
+   también debe mostrar `saldo_api` con `healthy: true`.
 
 ## 4. Cómo escalar réplicas
 

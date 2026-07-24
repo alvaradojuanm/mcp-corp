@@ -78,8 +78,14 @@ services:
         # Traefik balancea round-robin entre las réplicas de este servicio.
         - "traefik.http.services.mcp-corp.loadbalancer.server.port=8000"
 
-        # Traefik también puede vigilar la salud de cada réplica.
-        - "traefik.http.services.mcp-corp.loadbalancer.healthcheck.path=/health"
+        # Traefik también puede vigilar la salud de cada réplica. Es
+        # semántica de READINESS (decide a qué réplicas enrutar tráfico),
+        # no de liveness — por eso /ready, nunca /health: con /health,
+        # Traefik seguiría enrutando a una réplica que ya está drenando
+        # durante un apagado (/ready cae a 503 antes de que el proceso
+        # muera, pero /health sigue en 200 hasta el final). Corregido en
+        # la Fase 5 tras encontrarlo en mcp-corp-stack.yml.
+        - "traefik.http.services.mcp-corp.loadbalancer.healthcheck.path=/ready"
         - "traefik.http.services.mcp-corp.loadbalancer.healthcheck.interval=10s"
 
 networks:

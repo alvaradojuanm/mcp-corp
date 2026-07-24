@@ -5,14 +5,15 @@ repositorio es la **plantilla base** que se clonará para cada fuente de datos
 concreta; por eso esta fase prioriza claridad y solidez del andamiaje sobre
 velocidad de entrega.
 
-**Estado actual: Fase 4 — identificadores venezolanos + despliegue y escalado.**
-Fases 1 (andamiaje base), 2 (capa de conectores + Postgres) y 3 (conector
-HTTP + tools MCP + auditoría) cerradas. La Fase 4 tuvo dos partes: la
-Parte A normaliza y valida cédulas/RIF venezolanos (`identifiers.py`) para
-que las tools acepten el formato que de verdad escribe un usuario; la
-Parte B verifica bajo carga real la tesis central del diseño — más
-réplicas atienden más tráfico sin tocar el código — y deja el fail-closed
-del HMAC de auditoría en modo producción.
+**Estado actual: Fase 5 — artefactos de despliegue para entorno pre-productivo.**
+Fases 1 a 4 cerradas (andamiaje base, capa de conectores + Postgres,
+conector HTTP + tools MCP + auditoría, identificadores venezolanos y
+escalado horizontal verificado bajo carga). La Fase 5 resuelve cómo correr
+todo eso en Docker Swarm de verdad: secretos montados como archivo (Swarm
+no los entrega como variables de entorno), un stack file completo con
+HTTPS y límites de recursos, manifiestos de OpenShift/Kubernetes ya
+desplegables (no un esqueleto), y el runbook operativo — ver
+[`deploy/README.md`](deploy/README.md).
 
 ## Qué es esto
 
@@ -264,17 +265,28 @@ está levantado).
 
 ## Cómo desplegarlo en Docker Swarm
 
+Hay dos archivos, para dos propósitos distintos:
+
+- [`deploy/swarm/docker-compose.yml`](deploy/swarm/docker-compose.yml) —
+  demo mínima de la Fase 4, HTTP plano, pensada para probar el escalado
+  horizontal rápido en local.
+- [`deploy/swarm/mcp-corp-stack.yml`](deploy/swarm/mcp-corp-stack.yml) —
+  stack completo para el entorno **pre-productivo** (Fase 5): secretos de
+  Swarm montados como archivo, HTTPS con Let's Encrypt, límites de
+  recursos, logging acotado. **Usa este para cualquier cosa que no sea
+  una prueba rápida en tu laptop.**
+
 ```bash
-# Obligatorio: MCP_CORP_ENVIRONMENT=production (ya fijado en el compose)
-# exige MCP_CORP_AUDIT_HMAC_SECRET, fail-closed desde la Fase 4 — ver
-# "Modo producción y fail-closed del HMAC" más abajo.
-export MCP_CORP_AUDIT_HMAC_SECRET="$(python -c 'import secrets; print(secrets.token_hex(32))')"
-docker stack deploy -c deploy/swarm/docker-compose.yml mcp-corp
+docker stack deploy -c deploy/swarm/mcp-corp-stack.yml mcp-corp
 ```
 
-Ver los comentarios en [`deploy/swarm/docker-compose.yml`](deploy/swarm/docker-compose.yml)
-para el detalle de las labels de Traefik, el healthcheck, y cómo escalar
-réplicas desde Portainer.
+El procedimiento completo — construir y transportar la imagen sin
+registro, crear los secretos, verificar el despliegue, escalar, hacer
+rollback y troubleshooting — está en
+**[`deploy/README.md`](deploy/README.md)**, el runbook operativo de esta
+fase. Léelo antes de desplegar en un entorno real; el stack file por sí
+solo no basta, tiene varios `TODO` que hay que completar primero (ver los
+comentarios de cabecera del propio archivo).
 
 ## Cómo desplegarlo en OpenShift / Kubernetes
 
@@ -527,9 +539,13 @@ tests/
     └── test_tools_integration.py       # integración contra Postgres + stub de saldos reales
 
 deploy/
-├── swarm/                  # docker-compose.yml para Docker Swarm/Portainer
+├── README.md                # runbook operativo de despliegue (Fase 5)
+├── swarm/
+│   ├── docker-compose.yml         # demo mínima HTTP plano (Fase 4)
+│   ├── mcp-corp-stack.yml         # stack pre-productivo completo: secretos, HTTPS, recursos (Fase 5)
+│   └── saldo-api-stub-stack.yml   # stub de saldos opcional, solo para demo (Fase 5)
 ├── dev/                     # postgres-seed.sql + saldo_api_stub.py + load_test.py
-└── openshift/               # Deployment/Service/Route/ConfigMap + Secret de ejemplo (Fase 4)
+└── openshift/                # Deployment/Service/Route/Ingress/HPA/ConfigMap + Secret de ejemplo
 ```
 
 ## Decisiones de diseño
@@ -901,8 +917,11 @@ importa.
 
 ## Próximas fases (fuera de alcance aquí)
 
-- Fase 5+: gateway de gobierno, más tools de negocio, más conectores
+- Fase 6+: gateway de gobierno, más tools de negocio, más conectores
   (sistemas legacy) sobre el mismo protocolo `Connector` / `ResilientExecutor`.
+- Desplegar de verdad `deploy/swarm/mcp-corp-stack.yml` en un Swarm real y
+  completar los `TODO` (dominio, red interna de Postgres, URL de la API
+  de saldos real) — quedó listo para eso pero no ejecutado en este entorno.
 - Token bucket para límite de tasa (req/s) por fuente — hoy solo hay
   límite de concurrencia (ver `rate_limit_per_second` en `config.py`).
 - Estado del circuit breaker compartido entre réplicas (hoy es por
